@@ -16,6 +16,32 @@ def _int(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be an integer")
 
 
+def _detect_public_base_url() -> str | None:
+    """Resolve the public origin used by direct/stream links.
+
+    Explicit PUBLIC_BASE_URL always wins. Common managed hosts expose their
+    public URL through environment variables; supporting those makes the
+    direct-link feature work without requiring a second configuration value.
+    If none is available, a public URL cannot be invented safely.
+    """
+    explicit = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if explicit:
+        return explicit
+    render = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+    if render:
+        return render
+    railway = os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().rstrip("/")
+    if railway:
+        return railway if railway.startswith(("http://", "https://")) else f"https://{railway}"
+    app_url = os.getenv("APP_URL", "").strip().rstrip("/")
+    if app_url:
+        return app_url
+    heroku = os.getenv("HEROKU_APP_NAME", "").strip()
+    if heroku:
+        return f"https://{heroku}.herokuapp.com"
+    return None
+
+
 @dataclass(frozen=True)
 class Config:
     api_id: int
@@ -28,6 +54,11 @@ class Config:
     max_concurrent_jobs: int
     progress_interval: float
     sudo_users: frozenset[int]
+    public_base_url: str | None
+    web_host: str
+    web_port: int
+    direct_link_ttl: int
+    telegraph_access_token: str | None
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -52,6 +83,11 @@ class Config:
             max_concurrent_jobs=max(1, _int("MAX_CONCURRENT_JOBS", 2)),
             progress_interval=max(1.0, float(os.getenv("PROGRESS_INTERVAL", "3"))),
             sudo_users=frozenset(sudo),
+            public_base_url=_detect_public_base_url(),
+            web_host=os.getenv("WEB_HOST", "0.0.0.0").strip(),
+            web_port=_int("WEB_PORT", _int("PORT", 8080)),
+            direct_link_ttl=max(300, _int("DIRECT_LINK_TTL", 86400)),
+            telegraph_access_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip() or None,
         )
         cfg.download_dir.mkdir(parents=True, exist_ok=True)
         cfg.work_dir.mkdir(parents=True, exist_ok=True)

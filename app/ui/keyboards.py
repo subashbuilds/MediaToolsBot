@@ -20,6 +20,7 @@ def video_menu():
         [Button.inline("🎵 Stream Remover", b"video:streams"), Button.inline("🎵 Stream Extractor", b"video:extract")],
         [Button.inline("✂️ Video Trimmer", b"video:trim"), Button.inline("📕 Remove Audio", b"video:remove_audio")],
         [Button.inline("🎥 Video Optimize", b"video:optimize"), Button.inline("🎥 Videos Splitter", b"video:split")],
+        [Button.inline("🔀 Merge Tracks", b"video:merge")],
         [Button.inline("🖼️ Screenshots", b"video:shots"), Button.inline("🖼️ Manual Shots", b"video:manual")],
         [Button.inline("🎥 Generate Sample", b"video:sample"), Button.inline("🎵 Video To Audio", b"video:toaudio")],
         [Button.inline("🎥 Video To MP4", b"video:mp4"), Button.inline("🎥 Video To MKV", b"video:mkv")],
@@ -45,3 +46,11 @@ def upload_menu():
 
 def cancel_menu():
     return [[Button.inline("Cancel Process", b"cancel")]]
+
+
+def merge_menu():
+    return [
+        [Button.inline("➕ Add More Files", b"merge:add")],
+        [Button.inline("✅ Finish Merge", b"merge:finish")],
+        [Button.inline("❌ Cancel Merge", b"merge:cancel")],
+    ]

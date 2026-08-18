@@ -23,7 +23,7 @@ def flatten(rows):
 
 def test_ui_layout_counts():
     assert [len(r) for r in main_menu()] == [1, 1, 2, 1, 2, 1]
-    assert len(video_menu()) == 8
+    assert len(video_menu()) == 9
     assert len(audio_menu()) == 7
 
 
@@ -31,3 +31,9 @@ def test_callback_data_under_64_bytes():
     for rows in (main_menu(), video_menu(), audio_menu()):
         for b in flatten(rows):
             assert len(b.data) <= 64
+
+
+def test_merge_menu_exists_and_callbacks_are_small():
+    from app.ui.keyboards import merge_menu
+    assert any(b.data == b"merge:finish" for b in flatten(merge_menu()))
+    assert all(len(b.data) <= 64 for b in flatten(merge_menu()))

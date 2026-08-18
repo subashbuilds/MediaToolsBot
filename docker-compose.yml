@@ -5,4 +5,6 @@ services:
     env_file: .env
     volumes:
       - ./data:/data
+    ports:
+      - "8080:8080"
     command: python -m app

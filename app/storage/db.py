@@ -15,6 +15,12 @@ class DB:
             rename_file INTEGER NOT NULL DEFAULT 0,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
+        self.conn.execute("""CREATE TABLE IF NOT EXISTS direct_links(
+            token TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            path TEXT NOT NULL,
+            expires_at INTEGER NOT NULL
+        )""")
         self.conn.commit()
 
     def ensure(self, user_id: int) -> None:
@@ -39,6 +45,23 @@ class DB:
     def set_rename(self, user_id: int, enabled: bool) -> None:
         self.ensure(user_id)
         self.conn.execute("UPDATE users SET rename_file=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (int(enabled), user_id))
+        self.conn.commit()
+
+    def add_direct_link(self, token: str, user_id: int, path: str, expires_at: int) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO direct_links(token,user_id,path,expires_at) VALUES(?,?,?,?)",
+            (token, user_id, path, expires_at),
+        )
+        self.conn.commit()
+
+    def get_direct_link(self, token: str):
+        row = self.conn.execute(
+            "SELECT user_id,path,expires_at FROM direct_links WHERE token=?", (token,)
+        ).fetchone()
+        return row
+
+    def purge_direct_links(self, now: int) -> None:
+        self.conn.execute("DELETE FROM direct_links WHERE expires_at < ?", (now,))
         self.conn.commit()
 
     def close(self):
