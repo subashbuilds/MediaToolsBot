@@ -8,45 +8,52 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-def _bool(name: str, default: bool = False) -> bool:
-    return os.getenv(name, str(default)).strip().lower() in {"1", "true", "yes", "on"}
+def _int(name: str, default: int) -> int:
+    value = os.getenv(name, str(default)).strip()
+    try:
+        return int(value)
+    except ValueError:
+        raise RuntimeError(f"{name} must be an integer")
 
 
 @dataclass(frozen=True)
 class Config:
+    api_id: int
+    api_hash: str
     bot_token: str
-    sudo_users: set[int]
-    work_dir: Path
-    max_concurrent_jobs: int
-    keep_files: bool
     gofile_api_token: str | None
-    gofile_region: str
-    public_base_url: str | None
-    telegram_api_base: str | None
-    use_local_bot_api: bool
-    state_db: Path
+    download_dir: Path
+    work_dir: Path
+    db_path: Path
+    max_concurrent_jobs: int
+    progress_interval: float
+    sudo_users: frozenset[int]
 
     @classmethod
     def from_env(cls) -> "Config":
-        token = os.getenv("BOT_TOKEN", "").strip()
-        if not token:
-            raise RuntimeError("BOT_TOKEN is required")
-        sudo = {int(x) for x in os.getenv("SUDO_USERS", "").split(",") if x.strip().isdigit()}
-        work = Path(os.getenv("WORK_DIR", "/data/work")).resolve()
-        work.mkdir(parents=True, exist_ok=True)
-        state = work.parent / "state"
-        state.mkdir(parents=True, exist_ok=True)
-        base = os.getenv("TELEGRAM_API_BASE", "").strip() or None
-        return cls(
-            bot_token=token,
-            sudo_users=sudo,
-            work_dir=work,
-            max_concurrent_jobs=max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2"))),
-            keep_files=_bool("KEEP_FILES"),
+        api_id = _int("API_ID", 0)
+        api_hash = os.getenv("API_HASH", "").strip()
+        bot_token = os.getenv("BOT_TOKEN", "").strip()
+        if not api_id or not api_hash or not bot_token:
+            raise RuntimeError("API_ID, API_HASH and BOT_TOKEN are required")
+        sudo = set()
+        for item in os.getenv("SUDO_USERS", "").split(","):
+            item = item.strip()
+            if item:
+                sudo.add(int(item))
+        cfg = cls(
+            api_id=api_id,
+            api_hash=api_hash,
+            bot_token=bot_token,
             gofile_api_token=os.getenv("GOFILE_API_TOKEN", "").strip() or None,
-            gofile_region=os.getenv("GOFILE_UPLOAD_REGION", "auto").strip().lower(),
-            public_base_url=os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/") or None,
-            telegram_api_base=base,
-            use_local_bot_api=_bool("USE_LOCAL_BOT_API"),
-            state_db=state / "bot.sqlite3",
+            download_dir=Path(os.getenv("DOWNLOAD_DIR", "/data/downloads")),
+            work_dir=Path(os.getenv("WORK_DIR", "/data/work")),
+            db_path=Path(os.getenv("DB_PATH", "/data/bot.sqlite3")),
+            max_concurrent_jobs=max(1, _int("MAX_CONCURRENT_JOBS", 2)),
+            progress_interval=max(1.0, float(os.getenv("PROGRESS_INTERVAL", "3"))),
+            sudo_users=frozenset(sudo),
         )
+        cfg.download_dir.mkdir(parents=True, exist_ok=True)
+        cfg.work_dir.mkdir(parents=True, exist_ok=True)
+        cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
+        return cfg
