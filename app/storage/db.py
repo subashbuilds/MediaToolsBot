@@ -14,12 +14,19 @@ class DB:
             gofile_token TEXT,
             gofile_folder_id TEXT,
             rename_file INTEGER NOT NULL DEFAULT 0,
+            username TEXT,
+            first_name TEXT,
+            last_name TEXT,
+            first_seen_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP
         )""")
         # Migrate databases created by older builds without losing settings.
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)").fetchall()}
         if "gofile_folder_id" not in columns:
             self.conn.execute("ALTER TABLE users ADD COLUMN gofile_folder_id TEXT")
+        for column, definition in (("username", "TEXT"), ("first_name", "TEXT"), ("last_name", "TEXT"), ("first_seen_at", "TEXT")):
+            if column not in columns:
+                self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         self.conn.execute("""CREATE TABLE IF NOT EXISTS direct_links(
             token TEXT PRIMARY KEY,
             user_id INTEGER NOT NULL,
@@ -27,6 +34,24 @@ class DB:
             expires_at INTEGER NOT NULL
         )""")
         self.conn.commit()
+
+
+    def register_user(self, user_id: int, username: str | None = None, first_name: str | None = None, last_name: str | None = None) -> bool:
+        """Register/update a user. Returns True only for the first sighting."""
+        row = self.conn.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if row is None:
+            self.conn.execute(
+                "INSERT INTO users(user_id,username,first_name,last_name) VALUES(?,?,?,?)",
+                (user_id, username, first_name, last_name),
+            )
+            self.conn.commit()
+            return True
+        self.conn.execute(
+            "UPDATE users SET username=?, first_name=?, last_name=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?",
+            (username, first_name, last_name, user_id),
+        )
+        self.conn.commit()
+        return False
 
     def ensure(self, user_id: int) -> None:
         self.conn.execute("INSERT OR IGNORE INTO users(user_id) VALUES(?)", (user_id,))
@@ -52,6 +77,11 @@ class DB:
         self.conn.execute("UPDATE users SET gofile_folder_id=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (folder_id, user_id))
         self.conn.commit()
 
+    def get_username(self, user_id: int) -> str | None:
+        self.ensure(user_id)
+        row = self.conn.execute("SELECT username FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row[0] if row and row[0] else None
+
     def get_rename(self, user_id: int) -> bool:
         self.ensure(user_id)
         row = self.conn.execute("SELECT rename_file FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -74,6 +104,10 @@ class DB:
             "SELECT user_id,path,expires_at FROM direct_links WHERE token=?", (token,)
         ).fetchone()
         return row
+
+    def active_direct_paths(self, now: int) -> set[str]:
+        rows = self.conn.execute("SELECT path FROM direct_links WHERE expires_at >= ?", (now,)).fetchall()
+        return {str(Path(row[0]).resolve()) for row in rows}
 
     def purge_direct_links(self, now: int) -> None:
         self.conn.execute("DELETE FROM direct_links WHERE expires_at < ?", (now,))

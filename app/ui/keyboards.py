@@ -24,7 +24,7 @@ def video_menu():
         [Button.inline("🖼️ Screenshots", b"video:shots"), Button.inline("🖼️ Manual Shots", b"video:manual")],
         [Button.inline("🎥 Generate Sample", b"video:sample"), Button.inline("🎵 Video To Audio", b"video:toaudio")],
         [Button.inline("🎥 Video To MP4", b"video:mp4"), Button.inline("🎥 Video To MKV", b"video:mkv")],
-        [Button.inline("Cancel ❌", b"cancel")],
+        [Button.inline("⬅️ Back", b"video:back"), Button.inline("Cancel ❌", b"cancel")],
     ]
 
 
@@ -36,7 +36,7 @@ def audio_menu():
         [Button.inline("✂️ Audio Trimmer", b"audio:trim"), Button.inline("🗡️ Auto Trimmer", b"audio:auto")],
         [Button.inline("🎵 Speed Change", b"audio:speed"), Button.inline("🔊 Volume Change", b"audio:volume")],
         [Button.inline("Media Information", b"audio:info"), Button.inline("🔊 Compress Audio", b"audio:compress")],
-        [Button.inline("Cancel ❌", b"cancel")],
+        [Button.inline("⬅️ Back", b"audio:back"), Button.inline("Cancel ❌", b"cancel")],
     ]
 
 
@@ -55,4 +55,5 @@ def merge_menu():
     return [
         [Button.inline("✅ Finish Merge", b"merge:finish")],
         [Button.inline("❌ Cancel Merge", b"merge:cancel")],
+        [Button.inline("⬅️ Back", b"merge:back")],
     ]

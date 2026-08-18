@@ -17,8 +17,9 @@ class ProgressReporter:
     limits, so updates are throttled and duplicate text is suppressed.
     """
 
-    def __init__(self, callback: Callback, interval: float = 3.0):
+    def __init__(self, callback: Callback, interval: float = 3.0, progress_hook=None):
         self.callback = callback
+        self.progress_hook = progress_hook
         self.interval = max(1.0, float(interval))
         self.last = 0.0
         self.last_text = ""
@@ -39,6 +40,10 @@ class ProgressReporter:
             speed = current / elapsed
             pct = (current / total * 100) if total else 0.0
             eta = ((total - current) / speed) if total and speed > 0 else None
+            if self.progress_hook:
+                result = self.progress_hook(current, total, label)
+                if asyncio.iscoroutine(result):
+                    await result
             text = (
                 f"{label}\n"
                 f"{progress_bar(current, total)} {pct:5.1f}%\n"

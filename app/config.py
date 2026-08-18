@@ -59,6 +59,7 @@ class Config:
     web_port: int
     direct_link_ttl: int
     telegraph_access_token: str | None
+    session_timeout: int
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -80,7 +81,7 @@ class Config:
             download_dir=Path(os.getenv("DOWNLOAD_DIR", "/data/downloads")),
             work_dir=Path(os.getenv("WORK_DIR", "/data/work")),
             db_path=Path(os.getenv("DB_PATH", "/data/bot.sqlite3")),
-            max_concurrent_jobs=max(1, _int("MAX_CONCURRENT_JOBS", 2)),
+            max_concurrent_jobs=max(1, _int("MAX_CONCURRENT_JOBS", 10)),
             progress_interval=max(1.0, float(os.getenv("PROGRESS_INTERVAL", "3"))),
             sudo_users=frozenset(sudo),
             public_base_url=_detect_public_base_url(),
@@ -88,6 +89,7 @@ class Config:
             web_port=_int("WEB_PORT", _int("PORT", 8080)),
             direct_link_ttl=max(300, _int("DIRECT_LINK_TTL", 86400)),
             telegraph_access_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip() or None,
+            session_timeout=max(60, _int("SESSION_TIMEOUT", 21600)),
         )
         cfg.download_dir.mkdir(parents=True, exist_ok=True)
         cfg.work_dir.mkdir(parents=True, exist_ok=True)

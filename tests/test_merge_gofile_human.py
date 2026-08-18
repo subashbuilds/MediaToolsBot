@@ -25,7 +25,7 @@ def make_media(path: Path, kind: str):
 def test_merge_menu_has_only_finish_and_cancel():
     rows = merge_menu()
     labels = [row[0].text for row in rows]
-    assert labels == ["✅ Finish Merge", "❌ Cancel Merge"]
+    assert labels == ["✅ Finish Merge", "❌ Cancel Merge", "⬅️ Back"]
 
 
 def test_merge_dispatch_routes_captioned_media_before_pending_text():

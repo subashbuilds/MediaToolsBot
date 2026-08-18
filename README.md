@@ -14,6 +14,14 @@ Telegram officially supports bot authorization over MTProto with `API_ID`, `API_
 - Merge Tracks now creates a durable merge session seeded from the current media. The original first file is never lost when the current output changes. Each added Telegram/URL track is validated and counted before Finish Merge.
 - Media Information now calculates exact packet payload bytes per stream on demand and reports detailed codec, profile, language, resolution, pixel format, bit depth, FPS, color, channels, sample rate, bitrate, flags and per-stream size.
 - Cancellation clears pending merge sessions and removes the active process keyboard.
+- Merge validation no longer duplicates queued inputs; a 2.35 GiB video + 166.93 MiB audio is muxed once rather than being accidentally duplicated.
+- Functionality navigation edits the existing menu message and provides Back buttons.
+- Sudo-only Ongoing Processes view shows all active user sessions/jobs.
+- New-user notifications send Telegram ID and username to every configured sudo user on first contact.
+- Per-user concurrency is fixed at one; global concurrency defaults to ten.
+- Six-hour inactivity timeout removes the user's server-side files and unfinished workflow, with a timeout message explaining how to redo the task.
+- Successful Telegram/GoFile uploads clean up local files; valid direct-link files are retained until their link expires.
+- GoFile batch completion is written into the same progress message with individual filename, size and link.
 
 
 - Screenshot-matched inline menu hierarchy
@@ -57,9 +65,10 @@ GOFILE_API_TOKEN=
 DOWNLOAD_DIR=/data/downloads
 WORK_DIR=/data/work
 DB_PATH=/data/bot.sqlite3
-MAX_CONCURRENT_JOBS=2
+MAX_CONCURRENT_JOBS=10
 PROGRESS_INTERVAL=3
-SUDO_USERS=
+SUDO_USERS=123456789
+SESSION_TIMEOUT=21600
 ```
 
 ## Docker
@@ -163,7 +172,7 @@ Transfer progress messages are finalized into a plain completion message and the
 
 ## Merge Tracks workflow
 
-Merge is now a simple queue: after choosing **Merge Tracks**, the current media is immediately counted as file 1. Send additional Telegram media or HTTP(S) URLs directly; captioned Telegram audio/document messages are routed into the merge collector instead of being mistaken for text. The UI shows the live **Files queued** count and only **Finish Merge** and **Cancel Merge** buttons.
+Merge is now a simple queue: after choosing **Merge Tracks**, the current media is immediately counted as file 1. Send additional Telegram media or HTTP(S) URLs directly; captioned Telegram audio/document messages are routed into the merge collector instead of being mistaken for text. The UI shows the live **Files queued** count and **Finish Merge**, **Cancel Merge**, and **Back** buttons. The queue is validated from a snapshot, so inputs are never duplicated during validation.
 
 ## GoFile folder reuse
 
