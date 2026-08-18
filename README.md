@@ -6,6 +6,16 @@ Telegram officially supports bot authorization over MTProto with `API_ID`, `API_
 
 ## Features
 
+### Latest fixes
+
+- `/start` now shows bot status/information instead of opening the media-function menu.
+- Added **System Stats** for host OS, kernel, CPU/load, RAM, disk and uptime.
+- Generate Sample now uses low-overhead FFmpeg stream-copy into MKV, avoiding the RAM-heavy H.264 re-encode that can cause SIGKILL/OOM on constrained hosts.
+- Merge Tracks now creates a durable merge session seeded from the current media. The original first file is never lost when the current output changes. Each added Telegram/URL track is validated and counted before Finish Merge.
+- Media Information now calculates exact packet payload bytes per stream on demand and reports detailed codec, profile, language, resolution, pixel format, bit depth, FPS, color, channels, sample rate, bitrate, flags and per-stream size.
+- Cancellation clears pending merge sessions and removes the active process keyboard.
+
+
 - Screenshot-matched inline menu hierarchy
 - Telegram MTProto media download with live progress bar
 - Telegram MTProto upload with live progress bar
@@ -111,25 +121,24 @@ The offline test suite validates media operations, progress rendering, streaming
 
 The **Make Direct/Stream Link** feature is now served by the bot itself instead of relying on a GoFile direct-link field that may not be available for guest accounts. The HTTP endpoint uses `aiohttp.web.FileResponse`, so browsers can stream media and use HTTP Range requests.
 
-Configuration:
+Set: 
 
 ```env
-PUBLIC_BASE_URL=
+PUBLIC_BASE_URL=https://your-public-domain.example
 WEB_PORT=8080
 DIRECT_LINK_TTL=86400
 ```
 
-The bot automatically detects `RENDER_EXTERNAL_URL`, `RAILWAY_PUBLIC_DOMAIN`, `APP_URL`, or a Heroku app name when those hosting variables are present. For a VPS/custom reverse proxy, set `PUBLIC_BASE_URL` to the public HTTPS origin that reaches this service. There is no safe way to invent a public URL when the host does not provide one.
-
-After pressing **Make Direct/Stream Link**, the bot creates a signed URL such as `https://your-domain/f/<token>/<filename>`. The token expires after `DIRECT_LINK_TTL` seconds. The HTTP endpoint supports browser playback/download and Range requests.
+`PUBLIC_BASE_URL` must point to this bot's HTTP service. On a VPS, put Nginx/Caddy/Cloudflare in front of port 8080 if desired. On Railway, use the service's public domain and let `WEB_PORT` fall back to Railway's `PORT` when `WEB_PORT` is not set.
 
 ## Media Information
 
+The exact per-stream payload calculation intentionally runs only when Media Information is requested because FFprobe must inspect packets; this can take longer on multi-gigabyte files but avoids slowing every normal media operation.
+
+
 Media Information creates a formatted Telegra.ph page with file size, format, duration, bitrate and per-stream codec/language/title/resolution/FPS/channels/sample-rate/bitrate/default/forced information, then sends the page link in Telegram. The Telegraph API documents `createAccount` and `createPage` for this workflow.
 
-## URL input and stream source preservation
-
-Any plain `http://` or `https://` URL sent to the bot is now treated as a media URL automatically, even when Telegram attaches a WebPage preview. It is downloaded with progress and then opens the same function menu as a Telegram file. The URL uploader menu and `/urlupload` command remain available as explicit alternatives.
+## Stream source preservation
 
 Extracting a subtitle/audio/video stream no longer replaces the source used by the Stream Remover/Extractor menus. This prevents a common failure where extracting an SRT caused later video operations to inspect only the SRT file. Video-only operations automatically fall back to the preserved source video.
 

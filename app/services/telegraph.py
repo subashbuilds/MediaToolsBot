@@ -9,9 +9,10 @@ import aiohttp
 API = "https://api.telegra.ph"
 
 
-def _nodes_for_info(data: dict, filename: str, size_text: str) -> list[dict]:
+def _nodes_for_info(data: dict, filename: str, size_text: str, packet_sizes: dict[int, int] | None = None) -> list[dict]:
     fmt = data.get("format", {}) or {}
     streams = data.get("streams", []) or []
+    packet_sizes = packet_sizes or {}
     nodes: list[dict] = [
         {"tag": "h3", "children": [filename]},
         {"tag": "p", "children": [f"Size: {size_text}"]},
@@ -31,34 +32,28 @@ def _nodes_for_info(data: dict, filename: str, size_text: str) -> list[dict]:
         parts = [
             f"#{s.get('index', '?')} {str(s.get('codec_type', 'unknown')).title()}",
             f"Codec: {s.get('codec_name') or 'unknown'}",
-            f"Language: {tags.get('language', 'und')}",
         ]
-        if tags.get("title"):
-            parts.append(f"Title: {tags['title']}")
-        if s.get("width") and s.get("height"):
-            parts.append(f"Resolution: {s['width']}x{s['height']}")
-        if s.get("r_frame_rate") and s.get("r_frame_rate") != "0/0":
-            parts.append(f"FPS: {s['r_frame_rate']}")
-        if s.get("channels"):
-            parts.append(f"Channels: {s['channels']}")
-        if s.get("channel_layout"):
-            parts.append(f"Layout: {s['channel_layout']}")
-        if s.get("sample_rate"):
-            parts.append(f"Sample rate: {s['sample_rate']} Hz")
+        if s.get("codec_long_name"): parts.append(f"Codec name: {s['codec_long_name']}")
+        if s.get("profile"): parts.append(f"Profile: {s['profile']}")
+        parts.append(f"Language: {tags.get('language', 'und')}")
+        if tags.get("title"): parts.append(f"Title: {tags['title']}")
+        if s.get("width") and s.get("height"): parts.append(f"Resolution: {s['width']}x{s['height']}")
+        for key, label in (("pix_fmt", "Pixel format"), ("bits_per_raw_sample", "Bit depth"), ("r_frame_rate", "FPS"), ("sample_aspect_ratio", "SAR"), ("color_space", "Color space"), ("color_transfer", "Transfer"), ("color_primaries", "Primaries"), ("channels", "Channels"), ("channel_layout", "Layout"), ("sample_rate", "Sample rate")):
+            if s.get(key) and s.get(key) not in {"0/0", "0:1"}:
+                value = f"{s[key]} Hz" if key == "sample_rate" else s[key]
+                parts.append(f"{label}: {value}")
         if s.get("bit_rate"):
             parts.append(f"Bitrate: {s['bit_rate']} bps")
-        flags = []
-        if disp.get("default"):
-            flags.append("default")
-        if disp.get("forced"):
-            flags.append("forced")
-        if flags:
-            parts.append("Flags: " + ", ".join(flags))
+        exact = packet_sizes.get(int(s["index"])) if str(s.get("index", "")).isdigit() else None
+        if exact is not None:
+            parts.append(f"Packet payload size: {exact} bytes")
+        flags = [name for name in ("default", "forced", "hearing_impaired", "visual_impaired", "original") if disp.get(name)]
+        if flags: parts.append("Flags: " + ", ".join(flags))
         nodes.append({"tag": "p", "children": [" • ".join(parts)]})
     return nodes
 
 
-async def create_info_page(data: dict, filename: str, size_text: str, access_token: str | None = None) -> str:
+async def create_info_page(data: dict, filename: str, size_text: str, access_token: str | None = None, packet_sizes: dict[int, int] | None = None) -> str:
     timeout = aiohttp.ClientTimeout(total=30)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         token = access_token
@@ -69,7 +64,7 @@ async def create_info_page(data: dict, filename: str, size_text: str, access_tok
                 if not obj.get("ok"):
                     raise RuntimeError(f"Telegraph account creation failed: {obj.get('error', obj)}")
                 token = obj["result"]["access_token"]
-        content = _nodes_for_info(data, filename, size_text)
+        content = _nodes_for_info(data, filename, size_text, packet_sizes)
         payload = {
             "access_token": token,
             "title": f"Media Information - {filename[:220]}",

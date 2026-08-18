@@ -145,11 +145,20 @@ def manual_shot(path: Path, output: Path, timestamp: str) -> Path:
 
 
 def sample(path: Path, output: Path, seconds: int = 30) -> Path:
+    """Create a low-overhead sample without re-encoding the source.
+
+    Re-encoding a large 1080p/10-bit HEVC source just to make a short sample
+    can consume enough RAM/CPU to get a constrained container OOM-killed.
+    Matroska stream-copy is fast, preserves the original codecs, and is much
+    safer for VPS/Railway deployments.
+    """
     seconds = max(1, min(3600, int(seconds)))
+    output = output.with_suffix(".mkv")
     _run([
-        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path), "-t", str(seconds),
-        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast", "-crf", "24",
-        "-c:a", "aac", str(output)
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+        "-ss", "0", "-i", str(path), "-t", str(seconds),
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+        "-avoid_negative_ts", "make_zero", str(output)
     ])
     return output
 
