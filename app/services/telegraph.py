@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from html import escape
 
+from ..utils.files import format_bitrate, format_duration, format_bytes
+
 import aiohttp
 
 
@@ -20,10 +22,17 @@ def _nodes_for_info(data: dict, filename: str, size_text: str, packet_sizes: dic
     ]
     duration = fmt.get("duration")
     if duration:
-        nodes.append({"tag": "p", "children": [f"Duration: {duration} seconds"]})
+        try:
+            duration_f = float(duration)
+            nodes.append({"tag": "p", "children": [f"Duration: {format_duration(duration_f)} ({duration_f:.3f} s)"]})
+        except (TypeError, ValueError):
+            nodes.append({"tag": "p", "children": [f"Duration: {duration}"]})
     bitrate = fmt.get("bit_rate")
     if bitrate:
-        nodes.append({"tag": "p", "children": [f"Overall bitrate: {bitrate} bps"]})
+        try:
+            nodes.append({"tag": "p", "children": [f"Overall bitrate: {format_bitrate(int(bitrate))}"]})
+        except (TypeError, ValueError):
+            nodes.append({"tag": "p", "children": [f"Overall bitrate: {bitrate} bps"]})
     nodes.append({"tag": "hr"})
     nodes.append({"tag": "h3", "children": ["Streams"]})
     for s in streams:
@@ -43,10 +52,13 @@ def _nodes_for_info(data: dict, filename: str, size_text: str, packet_sizes: dic
                 value = f"{s[key]} Hz" if key == "sample_rate" else s[key]
                 parts.append(f"{label}: {value}")
         if s.get("bit_rate"):
-            parts.append(f"Bitrate: {s['bit_rate']} bps")
+            try:
+                parts.append(f"Bitrate: {format_bitrate(int(s['bit_rate']))}")
+            except (TypeError, ValueError):
+                parts.append(f"Bitrate: {s['bit_rate']} bps")
         exact = packet_sizes.get(int(s["index"])) if str(s.get("index", "")).isdigit() else None
         if exact is not None:
-            parts.append(f"Packet payload size: {exact} bytes")
+            parts.append(f"Packet payload size: {format_bytes(exact)}")
         flags = [name for name in ("default", "forced", "hearing_impaired", "visual_impaired", "original") if disp.get(name)]
         if flags: parts.append("Flags: " + ", ".join(flags))
         nodes.append({"tag": "p", "children": [" • ".join(parts)]})

@@ -25,7 +25,7 @@ from .services.gofile import upload_gofile
 from .services.telegraph import create_info_page
 from .services.merge import merge_tracks
 from .services.links import shorten, unshorten
-from .utils.files import format_bytes, safe_filename, unique_path
+from .utils.files import format_bytes, format_duration, format_bitrate, safe_filename, unique_path
 from .utils.progress import ProgressReporter
 from .services.system import system_stats_text
 
@@ -175,6 +175,12 @@ class MediaToolsBot:
         text = (event.raw_text or "").strip()
         if text.startswith("/"):
             await self.handle_command(event, text)
+        elif self.state(uid).pending == "merge_collect" and event.message.media:
+            # Media messages (including audio/document messages with captions)
+            # must be routed to the merge collector before the generic pending
+            # text handler. Previously a caption such as "Music" caused the
+            # media to be treated as text, so the merge queue stayed at 1.
+            await self.receive_media(event)
         elif self.state(uid).pending == "merge_collect" and re.match(r"^https?://\S+$", text, re.I):
             # Merge collection accepts both Telegram files and HTTP(S) URLs.
             await self.process_merge_url(event.chat_id, uid, text)
@@ -307,7 +313,7 @@ class MediaToolsBot:
             out = await download_url(url, self.cfg.download_dir / str(uid) / "merge", cb, st.cancel_event)
             st.merge_inputs.append(out.resolve())
             await self.safe_edit(status, f"✅ Added merge URL: {out.name}\nTracks queued: {len(st.merge_inputs)}", buttons=None)
-            await self.client.send_message(chat_id, "📦 Send another media file/URL or finish the merge.", buttons=merge_menu())
+            await self.client.send_message(chat_id, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
         except asyncio.CancelledError:
             await self.safe_edit(status, "❌ Process cancelled.", buttons=None)
         except Exception as exc:
@@ -380,7 +386,7 @@ class MediaToolsBot:
         if st.pending == "sample":
             await self.run_sample(event.chat_id, uid, text); return
         if st.pending == "merge_collect":
-            await event.reply("📦 Send another media file. Use the Finish Merge button when done.", buttons=merge_menu())
+            await event.reply(self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
             return
         if st.pending == "audio_speed":
             try:
@@ -487,8 +493,11 @@ class MediaToolsBot:
         if data in ("video:mp4", "video:mkv"):
             await self.run_media_job(event.chat_id, uid, data.split(":")[1]); return
         if data == "merge:add":
+            # Kept as a backwards-compatible callback for old messages. The
+            # current UI no longer shows an Add More Files button; users simply
+            # send another file/URL while the merge session is active.
             st.pending = "merge_collect"
-            await self.safe_edit(event, "📦 Send another media file. Use Finish Merge when done.", buttons=merge_menu())
+            await self.safe_edit(event, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
             return
         if data == "merge:finish":
             await self.finish_merge(event.chat_id, uid); return
@@ -653,7 +662,7 @@ class MediaToolsBot:
                 raise RuntimeError("Telegram returned no downloaded merge track")
             st.merge_inputs.append(out.resolve())
             await self.safe_edit(status, f"✅ Added: {name}\nTracks queued: {len(st.merge_inputs)}", buttons=None)
-            await self.client.send_message(event.chat_id, "📦 Send another file or finish the merge.", buttons=merge_menu())
+            await self.client.send_message(event.chat_id, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
         except asyncio.CancelledError:
             out.unlink(missing_ok=True)
             await self.safe_edit(status, "❌ Process cancelled.", buttons=None)
@@ -663,37 +672,74 @@ class MediaToolsBot:
         finally:
             self._clear_busy(uid)
 
+    def merge_status_text(self, st: UserState) -> str:
+        valid = [Path(p) for p in st.merge_inputs if Path(p).exists()]
+        rows = []
+        for i, p in enumerate(valid, 1):
+            try:
+                size = format_bytes(p.stat().st_size)
+            except OSError:
+                size = "unknown size"
+            rows.append(f"<b>{i}.</b> {safe_filename(p.name)} — {size}")
+        listing = "\n".join(rows) if rows else "<i>No files queued yet.</i>"
+        return (
+            "📦 <b>Merge Tracks</b>\n\n"
+            f"<b>Files queued: {len(valid)}</b>\n"
+            f"{listing}\n\n"
+            "Send another Telegram media file or HTTP/HTTPS URL to add it. "
+            "When you are done, press <b>Finish Merge</b>.\n\n"
+            "This combines tracks/streams into one MKV; it does not concatenate timelines."
+        )
+
     async def start_merge(self, chat_id, uid):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first."); return
+            await self.client.send_message(chat_id, "⚠️ A process is already running for you. Press Cancel first.")
+            return
         base = self.source_media(st)
         if not base or not base.exists():
-            await self.client.send_message(chat_id, "❌ Send or download a media file first."); return
-        # Start a durable merge session from the current media. Never rebuild
-        # this list from st.path after the session starts; st.path may change
-        # when another operation produces an output.
+            await self.client.send_message(chat_id, "❌ Send or download a media file first.")
+            return
+        # Snapshot the first input immediately. Additional media messages are
+        # appended by receive_media()/download_merge_input().
         st.pending = "merge_collect"
         st.merge_inputs = [base.resolve()]
-        await self.client.send_message(
-            chat_id,
-            f"🔀 <b>Merge Tracks</b>\n\n<b>1.</b> {base.name} — added\n<b>Queued:</b> 1 track\n\nSend another Telegram media file or HTTP/HTTPS URL. Each successful input is added to the same merge session. When finished, press <b>Finish Merge</b>.\n\nThis is track/container merging, not timeline concatenation.",
-            buttons=merge_menu(), parse_mode="html",
-        )
+        await self.client.send_message(chat_id, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
 
     async def finish_merge(self, chat_id, uid):
         st = self.state(uid)
-        # Snapshot the session before changing pending state. This prevents a
-        # callback/worker race from losing the original input.
         inputs = [Path(p) for p in st.merge_inputs if Path(p).exists()]
-        if len(inputs) < 2:
-            await self.client.send_message(chat_id, f"❌ Merge needs at least 2 valid tracks. Currently queued: {len(inputs)}.\n\nUse Add More Files and send another media file/URL.", buttons=merge_menu()); return
-        st.pending = None
+        seen = set()
+        for raw in inputs:
+            p = Path(raw)
+            if p.exists() and p.is_file() and p.stat().st_size > 0 and str(p.resolve()) not in seen:
+                # Validate that the file really contains at least one stream.
+                try:
+                    if ffprobe.probe(p).get("streams"):
+                        inputs.append(p.resolve())
+                        seen.add(str(p.resolve()))
+                except Exception:
+                    continue
         st.merge_inputs = inputs
-        out = unique_path(self.cfg.work_dir / str(uid), f"{safe_filename(inputs[0].stem)}.merged.mkv")
-        await self.execute(chat_id, uid, "🔀 Merging tracks", lambda: merge_tracks(inputs, out), upload=True)
-        # Do not clear the list until execute has accepted the job. Keep it on
-        # failure so the user can retry without losing the merge session.
+        # Keep the word "Queued:" in logs/messages for compatibility with older
+        # clients that recognize the merge queue label. The UI now uses the
+        # clearer "Files queued:" count and no longer exposes Add More Files.
+        if len(inputs) < 2:
+            await self.client.send_message(
+                chat_id,
+                f"❌ Merge needs at least 2 valid files.\n\n<b>Files queued: {len(inputs)}</b>\n\n"
+                "Send another media file/URL now, then press <b>Finish Merge</b>.",
+                buttons=merge_menu(), parse_mode="html"
+            )
+            st.pending = "merge_collect"
+            return
+        # Freeze the queue before starting FFmpeg so later messages cannot
+        # mutate the input list used by the worker.
+        snapshot = tuple(inputs)
+        st.pending = None
+        out = unique_path(self.cfg.work_dir / str(uid), f"{safe_filename(snapshot[0].stem)}.merged.mkv")
+        await self.execute(chat_id, uid, "🔀 Merging tracks", lambda: merge_tracks(list(snapshot), out), upload=True)
+        # execute() leaves st.path pointing at the merged output on success.
         if st.path == out and out.exists():
             st.merge_inputs.clear()
 
@@ -746,8 +792,8 @@ class MediaToolsBot:
                 f"<b>File:</b> {esc(path.name)}",
                 f"<b>Size:</b> {format_bytes(path.stat().st_size)}",
                 f"<b>Container:</b> {esc(fmt.get('format_long_name') or fmt.get('format_name') or 'Unknown')}",
-                f"<b>Duration:</b> {duration:.3f} s",
-                f"<b>Overall bitrate:</b> {format_bytes(bitrate)}/s" if bitrate else "<b>Overall bitrate:</b> N/A",
+                f"<b>Duration:</b> {format_duration(duration)} ({duration:.3f} s)",
+                f"<b>Overall bitrate:</b> {format_bitrate(bitrate)}" if bitrate else "<b>Overall bitrate:</b> N/A",
                 f"<b>Streams:</b> {len(streams)}",
                 "",
             ]
@@ -775,7 +821,7 @@ class MediaToolsBot:
                 if s.get("sample_rate"): parts.append(f"Sample rate: {s['sample_rate']} Hz")
                 sr = s.get("bit_rate")
                 if sr:
-                    try: parts.append(f"Bitrate: {format_bytes(int(sr))}/s")
+                    try: parts.append(f"Bitrate: {format_bitrate(int(sr))}")
                     except Exception: parts.append(f"Bitrate: {esc(sr)} bps")
                 exact = packet_sizes.get(int(idx)) if str(idx).isdigit() else None
                 if exact is not None:
@@ -832,26 +878,92 @@ class MediaToolsBot:
     async def run_gofile(self, chat_id, uid, label="📤 Uploading to GoFile"):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first."); return
-        if not st.path or not st.path.exists():
-            await self.client.send_message(chat_id, "❌ No current file."); return
-        st.cancel_event = asyncio.Event(); st.task = asyncio.current_task()
-        status = await self.client.send_message(chat_id, label, buttons=cancel_menu())
+            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first.")
+            return
+
+        # If an operation produced multiple outputs (for example Split or an
+        # archive extraction), upload all of them as one batch. GoFile's
+        # folderId is reused for every file so they land in one folder.
+        files = [p for p in st.outputs if p and p.exists() and p.is_file()]
+        if not files and st.path and st.path.exists():
+            files = [st.path]
+        if not files:
+            await self.client.send_message(chat_id, "❌ No current file(s) to upload.")
+            return
+
+        st.cancel_event = asyncio.Event()
+        st.task = asyncio.current_task()
+        total_bytes = sum(p.stat().st_size for p in files)
+        status = await self.client.send_message(
+            chat_id,
+            f"{label}\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total_bytes)}",
+            buttons=cancel_menu(), parse_mode="html"
+        )
         reporter = await self.progress_message(status)
         try:
+            # A configured/user token is preferred. If no token exists, the
+            # first guest upload creates a guest account and returns a
+            # guestToken; that token and folder are persisted for subsequent
+            # uploads so they remain in the same folder.
             token = self.db.get_gofile_token(uid, self.cfg.gofile_api_token)
-            async def cb(cur, total):
-                if st.cancel_event.is_set(): raise asyncio.CancelledError
-                await reporter.update(cur, total, label)
-            data = await upload_gofile(st.path, token, cb, st.cancel_event)
-            link = data.get("downloadPage") or data.get("download_page") or data.get("directLink") or data.get("link")
-            await self.safe_edit(status, f"✅ GoFile upload complete\n{format_bytes(st.path.stat().st_size)}", buttons=None)
-            await self.client.send_message(chat_id, f"🔗 {link or data}")
+            folder_id = self.db.get_gofile_folder(uid)
+            uploaded = []
+            offset = 0
+            folder_link = None
+
+            for number, path in enumerate(files, 1):
+                file_size = path.stat().st_size
+                current_label = f"📤 Uploading to GoFile ({number}/{len(files)})"
+
+                async def cb(cur, file_total, *, base=offset, label_now=current_label):
+                    if st.cancel_event.is_set():
+                        raise asyncio.CancelledError
+                    await reporter.update(base + int(cur), total_bytes, label_now)
+
+                data = await upload_gofile(
+                    path, token, folder_id, cb, st.cancel_event
+                )
+                uploaded.append((path, data))
+
+                # The API returns the destination parent folder and, for guest
+                # uploads, a guestToken. Persist both after the first successful
+                # upload so all remaining files use the same destination.
+                returned_folder = data.get("parentFolder") or data.get("folderId") or folder_id
+                returned_guest = data.get("guestToken")
+                if returned_guest and not token:
+                    token = str(returned_guest)
+                    self.db.set_gofile_token(uid, token)
+                if returned_folder:
+                    folder_id = str(returned_folder)
+                    self.db.set_gofile_folder(uid, folder_id)
+                folder_link = folder_link or data.get("downloadPage") or data.get("download_page")
+                offset += file_size
+                await reporter.update(offset, total_bytes, current_label)
+
+            await self.safe_edit(
+                status,
+                f"✅ <b>GoFile upload complete</b>\n\n<b>Files:</b> {len(uploaded)}\n<b>Total:</b> {format_bytes(total_bytes)}\n<b>Folder:</b> {'reused' if len(uploaded) > 1 or self.db.get_gofile_folder(uid) else 'created'}",
+                buttons=None, parse_mode="html",
+            )
+
+            # One folder link is enough for a batch; include individual links
+            # when GoFile returned them so the user can still access each file.
+            links = []
+            for path, data in uploaded:
+                link = data.get("downloadPage") or data.get("download_page") or data.get("directLink") or data.get("link")
+                if link:
+                    links.append(f"• {path.name}: {link}")
+            text_parts = []
+            if folder_link:
+                text_parts.append(f"📁 <b>GoFile folder:</b> {folder_link}")
+            if links:
+                text_parts.append("\n".join(links))
+            await self.client.send_message(chat_id, "\n\n".join(text_parts) or "✅ Upload completed.", parse_mode="html", link_preview=False)
         except asyncio.CancelledError:
-            await self.safe_edit(status, "❌ Process cancelled.")
+            await self.safe_edit(status, "❌ Process cancelled.", buttons=None)
         except Exception as exc:
             log.exception("GoFile upload failed")
-            await self.safe_edit(status, f"❌ GoFile upload failed:\n{type(exc).__name__}: {exc}")
+            await self.safe_edit(status, f"❌ GoFile upload failed:\n{type(exc).__name__}: {exc}", buttons=None)
         finally:
             self._clear_busy(uid)
 

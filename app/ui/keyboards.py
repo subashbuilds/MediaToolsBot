@@ -49,8 +49,10 @@ def cancel_menu():
 
 
 def merge_menu():
+    # While collecting, users simply send additional media/URLs. There is no
+    # separate "Add More Files" action: the queue count is shown in the
+    # message and the only actions are Finish and Cancel.
     return [
-        [Button.inline("➕ Add More Files", b"merge:add")],
         [Button.inline("✅ Finish Merge", b"merge:finish")],
         [Button.inline("❌ Cancel Merge", b"merge:cancel")],
     ]

@@ -1,40 +1,28 @@
-# Media Tools Bot — Verification Report
+# Verification Report
 
-Date: 2026-08-18
+Final revision: merge queue routing/UI, human-readable media information, and GoFile folder reuse.
 
-## Final verification
+## Offline test result
 
-The source was compiled, the complete offline test suite was run, the project was packaged into a ZIP, then the ZIP was extracted into a clean directory and the complete suite was run again.
+`38 passed in 14.41s`
 
-Final local suite:
+## Verified
 
-**31 passed**
+- Python compilation
+- FFmpeg/FFprobe media processing
+- Video + audio + video merge
+- Merge queue UI contains only Finish and Cancel
+- Captioned Telegram media is routed to merge collection before pending-text handling
+- Merge queue preserves the first media and validates added inputs
+- Human-readable duration, sizes, and bitrates
+- SQLite migration for GoFile folder state
+- GoFile multipart payload includes `folderId` when reusing a folder
+- Guest token + folder reuse flow
+- Batch GoFile upload contract for multiple outputs
+- Existing URL download/cancel behavior
+- Existing direct-link Range behavior
+- Existing sample stream-copy behavior
+- Existing MTProto transport contract
+- Existing archive, progress, UI and cancellation tests
 
-Covered in this revision:
-
-- Telethon 1.44.0 MTProto transport contract
-- Telegram download/upload progress callback wiring
-- HTTP URL routing before Telegram WebPage media handling
-- URL download and cancellation cleanup
-- direct-link URL generation and HTTP Range behavior
-- FFprobe media/stream inspection
-- exact per-stream packet payload byte calculation
-- detailed Media Information generation path
-- source preservation after stream extraction
-- stream remover/extractor mappings
-- video/audio/subtitle stream detection
-- low-overhead sample generation using stream copy
-- HEVC Main 10 + E-AC-3 sample smoke test
-- video + audio + video merge
-- multi-track merge service
-- merge-session persistence/queue logic
-- cancellation and pending-state cleanup
-- progress rendering and completion behavior
-- archive extraction safety
-- Docker/source compilation checks
-
-## Live-integration limitation
-
-This isolated build environment does not have the user's Telegram credentials and cannot perform a real Telegram MTProto login or multi-gigabyte Telegram/GoFile transfer. Docker is also not installed in the build environment, so a real `docker build` was not executed. Those are therefore not represented as live tests.
-
-Telethon documentation was checked against 1.44.0 before implementation. The documented `download_media()` and `send_file()` APIs support asynchronous progress callbacks.
+The test suite was run from a clean source tree and then again after packaging/extracting the final ZIP. Live Telegram and GoFile transfers cannot be performed in this isolated build environment without deployment credentials/network access.

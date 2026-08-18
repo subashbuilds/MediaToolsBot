@@ -45,6 +45,22 @@ def format_duration(seconds: float | None) -> str:
     return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
 
 
+
+def format_bitrate(bits_per_second: int | float | None) -> str:
+    """Format a bitrate as human-readable decimal bits per second."""
+    if bits_per_second is None:
+        return "N/A"
+    n = float(bits_per_second)
+    if n < 1000:
+        return f"{n:.0f} bps"
+    units = ("kb/s", "Mb/s", "Gb/s", "Tb/s")
+    n /= 1000.0
+    for unit in units:
+        if n < 1000 or unit == units[-1]:
+            return f"{n:.2f} {unit}"
+        n /= 1000.0
+    return f"{n:.2f} Tb/s"
+
 def progress_bar(current: int, total: int, width: int = 14) -> str:
     if total <= 0:
         return "░" * width

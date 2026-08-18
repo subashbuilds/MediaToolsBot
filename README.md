@@ -160,3 +160,15 @@ Transfer progress messages are finalized into a plain completion message and the
 ## Help
 
 `/help` now provides a dedicated feature/command guide instead of opening the main function menu.
+
+## Merge Tracks workflow
+
+Merge is now a simple queue: after choosing **Merge Tracks**, the current media is immediately counted as file 1. Send additional Telegram media or HTTP(S) URLs directly; captioned Telegram audio/document messages are routed into the merge collector instead of being mistaken for text. The UI shows the live **Files queued** count and only **Finish Merge** and **Cancel Merge** buttons.
+
+## GoFile folder reuse
+
+GoFile uploads reuse one destination folder per user. The first upload without a configured token creates the guest account/folder and persists the returned guest token and parent folder. Subsequent files are uploaded with the same `folderId`, so split/archive batches are kept together instead of creating a new folder for every file. `/cleargofile` clears the saved token and folder and returns to guest mode on the next upload. This follows GoFile's current API documentation, which explicitly supports reusing `folderId` for subsequent uploads.
+
+## Human-readable media information
+
+Media Information displays duration as `HH:MM:SS`/`MM:SS`, file and per-stream payload sizes using B/KiB/MiB/GiB, and bitrates using bps/kb/s/Mb/s/Gb/s. The Telegraph detail page uses the same readable units while retaining detailed codec/stream metadata.

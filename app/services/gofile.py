@@ -7,6 +7,9 @@ import aiohttp
 from aiohttp import payload
 
 
+UPLOAD_ENDPOINT = "https://upload.gofile.io/uploadfile"
+
+
 class ProgressFilePayload(payload.Payload):
     def __init__(self, path: Path, callback=None, chunk_size: int = 1024 * 1024,
                  cancel_event: asyncio.Event | None = None):
@@ -42,13 +45,16 @@ class ProgressFilePayload(payload.Payload):
 async def upload_gofile(
     path: Path,
     token: str | None = None,
+    folder_id: str | None = None,
     progress=None,
     cancel_event: asyncio.Event | None = None,
 ) -> dict:
-    """Upload one file using Gofile's documented global endpoint.
+    """Upload one file to GoFile, optionally reusing an existing folder.
 
-    Omitting Authorization creates a guest upload. Supplying a token sends
-    Authorization: Bearer <token>.
+    Per the current GoFile API documentation, omitting folderId creates a new
+    public folder. Reusing the returned parentFolder/folderId puts subsequent
+    uploads into the same folder. A returned guestToken can likewise be reused
+    for guest-account uploads.
     """
     if not path.is_file():
         raise FileNotFoundError(path)
@@ -57,8 +63,12 @@ async def upload_gofile(
 
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         mp = aiohttp.MultipartWriter("form-data")
+        if folder_id:
+            folder_payload = payload.StringPayload(folder_id)
+            folder_payload.headers["Content-Disposition"] = 'form-data; name="folderId"'
+            mp.append_payload(folder_payload)
         mp.append_payload(ProgressFilePayload(path, progress, cancel_event=cancel_event))
-        async with session.post("https://upload.gofile.io/uploadfile", data=mp) as r:
+        async with session.post(UPLOAD_ENDPOINT, data=mp) as r:
             text = await r.text()
             if r.status >= 400:
                 raise RuntimeError(f"GoFile HTTP {r.status}: {text[:500]}")
@@ -68,4 +78,7 @@ async def upload_gofile(
                 raise RuntimeError(f"GoFile returned invalid JSON: {text[:500]}") from exc
             if data.get("status") != "ok":
                 raise RuntimeError(str(data))
-            return data.get("data", data)
+            result = data.get("data", data)
+            if not isinstance(result, dict):
+                raise RuntimeError(f"Unexpected GoFile response: {result!r}")
+            return result
