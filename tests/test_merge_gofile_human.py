@@ -120,5 +120,5 @@ def test_gofile_batch_and_human_info_contracts():
     assert "total_bytes = sum(p.stat().st_size for p in files)" in source
     assert "folder_id = self.db.get_gofile_folder(uid)" in source
     assert "self.db.set_gofile_folder(uid, folder_id)" in source
-    assert "format_duration(duration)" in source
-    assert "format_bitrate(bitrate)" in source
+    assert "Open detailed Media Information" in source
+    assert "stream_packet_sizes" in source

@@ -4,10 +4,13 @@ from telethon import Button
 
 
 def main_menu():
+    # A media file/URL is already present here, so URL Uploader is deliberately
+    # omitted. The /urlupload command remains available for a fresh URL-only
+    # upload workflow.
     return [
         [Button.inline("🖼️ Thumbnail Downloader", b"menu:thumb")],
         [Button.inline("🔗 Make Direct/Stream Link", b"menu:direct")],
-        [Button.inline("Extract Archive", b"menu:archive"), Button.inline("🔗 Url Uploader", b"menu:urlupload")],
+        [Button.inline("Extract Archive", b"menu:archive")],
         [Button.inline("🔗 Link Short & Unshort", b"menu:links")],
         [Button.inline("🎵 Audio", b"menu:audio"), Button.inline("🎥 Video", b"menu:video")],
         [Button.inline("Cancel", b"cancel")],
@@ -16,7 +19,7 @@ def main_menu():
 
 def video_menu():
     return [
-        [Button.inline("Media Information", b"video:info")],
+        [Button.inline("📋 Media Information", b"video:info")],
         [Button.inline("🎵 Stream Remover", b"video:streams"), Button.inline("🎵 Stream Extractor", b"video:extract")],
         [Button.inline("✂️ Video Trimmer", b"video:trim"), Button.inline("📕 Remove Audio", b"video:remove_audio")],
         [Button.inline("🎥 Video Optimize", b"video:optimize"), Button.inline("🎥 Videos Splitter", b"video:split")],
@@ -35,13 +38,47 @@ def audio_menu():
         [Button.inline("🔊 Bass Booster", b"audio:bass"), Button.inline("🔊 Treble Booster", b"audio:treble")],
         [Button.inline("✂️ Audio Trimmer", b"audio:trim"), Button.inline("🗡️ Auto Trimmer", b"audio:auto")],
         [Button.inline("🎵 Speed Change", b"audio:speed"), Button.inline("🔊 Volume Change", b"audio:volume")],
-        [Button.inline("Media Information", b"audio:info"), Button.inline("🔊 Compress Audio", b"audio:compress")],
+        [Button.inline("📋 Media Information", b"audio:info"), Button.inline("🔊 Compress Audio", b"audio:compress")],
         [Button.inline("⬅️ Back", b"audio:back"), Button.inline("Cancel ❌", b"cancel")],
     ]
 
 
 def upload_menu():
-    return [[Button.inline("Telegram (MTProto)", b"upload:telegram")], [Button.inline("GoFile", b"upload:gofile")], [Button.inline("Cancel", b"cancel")]]
+    return [
+        [Button.inline("📤 Telegram (MTProto)", b"upload:telegram"), Button.inline("☁️ GoFile", b"upload:gofile")],
+        [Button.inline("⬅️ Back", b"upload:back"), Button.inline("Cancel", b"cancel")],
+    ]
+
+
+def rename_menu():
+    return [
+        [Button.inline("✏️ Rename", b"rename:yes"), Button.inline("⏭️ Skip", b"rename:skip")],
+        [Button.inline("Cancel", b"cancel")],
+    ]
+
+
+def settings_menu(rename_enabled: bool = False, upload_mode: str = "choose"):
+    rename_yes = "✏️ Rename: ON ✅" if rename_enabled else "✏️ Rename: ON"
+    rename_no = "✏️ Rename: OFF ✅" if not rename_enabled else "✏️ Rename: OFF"
+    telegram = "📤 Upload: Telegram ✅" if upload_mode == "telegram" else "📤 Upload: Telegram"
+    gofile = "☁️ Upload: GoFile ✅" if upload_mode == "gofile" else "☁️ Upload: GoFile"
+    choose = "❓ Upload: Choose ✅" if upload_mode == "choose" else "❓ Upload: Choose"
+    return [
+        [Button.inline(rename_yes, b"settings:rename:on"), Button.inline(rename_no, b"settings:rename:off")],
+        [Button.inline(telegram, b"settings:upload:telegram")],
+        [Button.inline(gofile, b"settings:upload:gofile")],
+        [Button.inline(choose, b"settings:upload:choose")],
+        [Button.inline("⬅️ Back", b"start:home")],
+    ]
+
+
+def admin_menu():
+    return [
+        [Button.inline("🧭 Ongoing Processes", b"admin:processes")],
+        [Button.inline("🛑 Cancel User Job", b"admin:cancel_user")],
+        [Button.inline("📢 Broadcast", b"admin:broadcast")],
+        [Button.inline("⬅️ Back", b"start:home")],
+    ]
 
 
 def cancel_menu():
@@ -49,9 +86,6 @@ def cancel_menu():
 
 
 def merge_menu():
-    # While collecting, users simply send additional media/URLs. There is no
-    # separate "Add More Files" action: the queue count is shown in the
-    # message and the only actions are Finish and Cancel.
     return [
         [Button.inline("✅ Finish Merge", b"merge:finish")],
         [Button.inline("❌ Cancel Merge", b"merge:cancel")],

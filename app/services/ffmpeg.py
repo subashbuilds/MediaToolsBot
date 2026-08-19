@@ -7,10 +7,11 @@ from pathlib import Path
 from typing import Iterable
 
 from .ffprobe import probe
+from .process_control import run_command
 
 
 def _run(args: list[str]) -> subprocess.CompletedProcess:
-    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+    return run_command(args, text=True)
 
 
 def duration(path: Path) -> float:

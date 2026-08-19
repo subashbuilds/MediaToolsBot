@@ -98,7 +98,9 @@ def test_video_source_falls_back_to_original_when_current_is_subtitle(tmp_path, 
 
 def test_cancel_clears_pending_and_keyboard():
     source = Path("app/main.py").read_text()
-    assert 'await self.safe_edit(source_message, "❌ Process cancelled.", buttons=None)' in source
+    assert 'async def cancel(self, uid, chat_id, source_message=None, admin: bool = False)' in source
+    assert 'await self.clear_status_message(uid, delete=True)' in source
+    assert 'send_start_info(chat_id, uid' in source
     assert 'st.pending = None' in source
 
 

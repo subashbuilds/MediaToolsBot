@@ -22,7 +22,7 @@ def flatten(rows):
 
 
 def test_ui_layout_counts():
-    assert [len(r) for r in main_menu()] == [1, 1, 2, 1, 2, 1]
+    assert [len(r) for r in main_menu()] == [1, 1, 1, 1, 2, 1]
     assert len(video_menu()) == 9
     assert len(audio_menu()) == 7
 

@@ -1,183 +1,484 @@
-# Media Tools Bot — Telegram MTProto edition
+# 🎬 Media Tools Bot
 
-This build intentionally uses **Telegram MTProto**, not the HTTP Bot API and not the Local Bot API Server.
+> A production-oriented Telegram media toolkit built around **Telegram MTProto + FFmpeg/FFprobe**, with large-file transfers, stream manipulation, screenshots, merging, GoFile uploads, direct browser links, per-user cleanup, and sudo administration.
 
-Telegram officially supports bot authorization over MTProto with `API_ID`, `API_HASH` and `BOT_TOKEN`. Telethon 1.44.0 is used for that transport.
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Telethon](https://img.shields.io/badge/Telegram-MTProto-26A5E4?logo=telegram&logoColor=white)](https://docs.telethon.dev/)
+[![FFmpeg](https://img.shields.io/badge/FFmpeg-8.x%2B-007808?logo=ffmpeg&logoColor=white)](https://ffmpeg.org/)
+[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
 
-## Features
+## ✨ What it does
 
-### Latest fixes
+Media Tools Bot accepts either a **Telegram media file** or an **HTTP/HTTPS URL**. Once media is available, the bot exposes the same processing workflow for both input types.
 
-- `/start` now shows bot status/information instead of opening the media-function menu.
-- Added **System Stats** for host OS, kernel, CPU/load, RAM, disk and uptime.
-- Generate Sample now uses low-overhead FFmpeg stream-copy into MKV, avoiding the RAM-heavy H.264 re-encode that can cause SIGKILL/OOM on constrained hosts.
-- Merge Tracks now creates a durable merge session seeded from the current media. The original first file is never lost when the current output changes. Each added Telegram/URL track is validated and counted before Finish Merge.
-- Media Information now calculates exact packet payload bytes per stream on demand and reports detailed codec, profile, language, resolution, pixel format, bit depth, FPS, color, channels, sample rate, bitrate, flags and per-stream size.
-- Cancellation clears pending merge sessions and removes the active process keyboard.
-- Merge validation no longer duplicates queued inputs; a 2.35 GiB video + 166.93 MiB audio is muxed once rather than being accidentally duplicated.
-- Functionality navigation edits the existing menu message and provides Back buttons.
-- Sudo-only Ongoing Processes view shows all active user sessions/jobs.
-- New-user notifications send Telegram ID and username to every configured sudo user on first contact.
-- Per-user concurrency is fixed at one; global concurrency defaults to ten.
-- Six-hour inactivity timeout removes the user's server-side files and unfinished workflow, with a timeout message explaining how to redo the task.
-- Successful Telegram/GoFile uploads clean up local files; valid direct-link files are retained until their link expires.
-- GoFile batch completion is written into the same progress message with individual filename, size and link.
+### 🎞️ Video
 
-
-- Screenshot-matched inline menu hierarchy
-- Telegram MTProto media download with live progress bar
-- Telegram MTProto upload with live progress bar
-- GoFile upload with live progress bar
-- GoFile authenticated or guest upload
-- `/upload telegram` and `/upload gofile`
-- `/setgofile TOKEN`, `/cleargofile`
-- Dynamic FFprobe stream listing
-- Stream removal / custom stream removal
-- Stream extraction
-- Media information
-- Video trimming, optimization, splitting, screenshots, samples
-- Video to audio / MP4 / MKV
-- Audio conversion, 8D, equalizer, bass, treble, trim, auto trim, speed, volume, compression
+- Detailed Media Information → Telegraph page
+- Stream Remover
+- Stream Extractor
+- Custom stream selection
+- Video trimming
+- Audio removal
+- Lossless video optimization/remuxing
+- Video splitting
+- Screenshots: **1–20** images
+- Manual screenshots: **1–20 timestamps** in one request
+- Low-overhead sample generation
+- Video → Audio
+- Video → MP4
+- Video → MKV
 - Thumbnail extraction
-- ZIP/TAR extraction plus 7z/RAR support through installed system tools
-- URL downloading with progress
-- Link shortening/unshortening
-- Cancellation checks during network transfers
-- SQLite per-user settings
-- Docker deployment
+- Merge Tracks
 
-## Environment
+### 🎵 Audio
 
-Copy `.env.example` to `.env` and set:
+- Audio conversion
+- 8D
+- Equalizer
+- Bass / treble boost
+- Audio trimming
+- Automatic trimming
+- Speed change
+- Volume change
+- Compression
 
-```env
-API_ID=123456
-API_HASH=...
-BOT_TOKEN=...
+### 🔀 Merge Tracks
+
+Merge is **stream/container muxing**, not timeline concatenation.
+
+Examples:
+
+```text
+Video + Audio
+Video + Video
+Video + Audio + Audio
+Video + Subtitle
+Video + Video + Audio + Subtitle
 ```
 
-`API_ID` and `API_HASH` come from https://my.telegram.org. `BOT_TOKEN` comes from @BotFather.
+The first media already in the user's session becomes **file 1 automatically**. Users simply send more media files or URLs. The UI shows the live queue count and only exposes **Finish Merge**, **Cancel Merge**, and **Back**.
 
-Optional:
+### ☁️ Uploads
+
+- Telegram upload through **Telethon MTProto**
+- GoFile upload
+- GoFile guest uploads when no API token is configured
+- GoFile API-token uploads
+- Multiple output files share one GoFile destination folder
+- Per-file filename, human-readable size and GoFile link in the final result
+- Upload progress with speed and ETA
+
+### 🔗 Direct / Stream Links
+
+The bot can serve a local media file through its own HTTP server.
+
+- Browser playback
+- Download
+- HTTP Range requests / seeking
+- Signed random token
+- Configurable expiry
+- Railway/Render public URL auto-detection
+
+## 🧭 User workflow
+
+### 1. `/start`
+
+`/start` is an information dashboard, not the media-function menu.
+
+It shows:
+
+- Bot status
+- MTProto transport
+- FFmpeg / FFprobe status
+- Current user's job state
+- Global concurrency limit
+- Settings
+- Help
+- System statistics
+- Sudo-only admin controls
+
+### 2. Send media
+
+Send:
+
+- Telegram document/video/audio, or
+- HTTP/HTTPS URL
+
+URL input is detected **before Telegram WebPage preview handling**, so a URL is downloaded as a URL instead of being passed to Telethon's Telegram-media downloader.
+
+### 3. Process
+
+The media-function menu is edited in place. Navigation uses one stable UI message wherever Telegram allows it.
+
+### 4. Upload
+
+If Rename File is enabled, the bot asks:
+
+```text
+Rename
+Skip
+```
+
+`Skip` goes directly to the configured upload destination or destination selector.
+
+## ⚙️ Settings
+
+The settings screen displays the currently selected values:
+
+- Rename File: Yes / No
+- Upload Destination: Telegram / GoFile / Choose before upload
+
+Commands:
+
+```text
+/rename on
+/rename off
+/uploadmode telegram
+/uploadmode gofile
+/uploadmode choose
+```
+
+## 📤 Upload commands
+
+```text
+/upload
+/upload telegram
+/upload gofile
+```
+
+GoFile token:
+
+```text
+/setgofile YOUR_API_TOKEN
+/cleargofile
+```
+
+If no GoFile token exists, the uploader starts a guest upload. The returned guest token and destination folder are retained for subsequent files in the same user session/account model.
+
+GoFile's current API documents `folderId` reuse for putting subsequent uploads into the same folder.
+
+## 🛡️ Sudo administration
+
+Set:
 
 ```env
-GOFILE_API_TOKEN=
-DOWNLOAD_DIR=/data/downloads
-WORK_DIR=/data/work
-DB_PATH=/data/bot.sqlite3
+SUDO_USERS=123456789,987654321
+```
+
+Only those Telegram IDs receive the admin controls.
+
+### Ongoing Processes
+
+The admin view intentionally stays simple:
+
+```text
+username — number of processes
+```
+
+Normal users never see this screen.
+
+### Cancel User Job
+
+Sudo users can cancel a user's active workflow by:
+
+```text
+/canceluser 123456789
+/canceluser @username
+```
+
+The admin UI provides the same action.
+
+### Broadcast
+
+```text
+/broadcast Your message here
+```
+
+or use the sudo-only Broadcast button and enter the message interactively.
+
+New users are reported to sudo users with:
+
+- Display name
+- Username
+- Telegram ID
+
+## ⏱️ Concurrency and cleanup
+
+Defaults:
+
+```env
 MAX_CONCURRENT_JOBS=10
-PROGRESS_INTERVAL=3
-SUDO_USERS=123456789
-SESSION_TIMEOUT=21600
 ```
 
-## Docker
+- Maximum **1 active process per normal user**
+- Maximum **10 active heavy jobs globally** by default
+- Six-hour inactivity timeout
+- Cancelled workflows do **not** delete the user's files immediately
+- Completed Telegram/GoFile uploads clean local files
+- Expired direct-link files are cleaned when their links expire
+- Timed-out sessions remove server-side working files and reset the workflow
+
+## 🧹 Cancellation behavior
+
+Cancellation is intentionally stateful:
+
+1. Stop the user's pending workflow.
+2. Signal/cancel the active task.
+3. Remove the active progress message.
+4. Clear operation menus.
+5. Return the existing UI to the Start dashboard.
+6. Keep the user's files intact unless the session later expires or an upload has already completed.
+
+This prevents stale `Cancel Process` keyboards from accumulating.
+
+## 📋 Media Information
+
+The Telegram response is intentionally compact:
+
+```text
+📋 filename.mkv
+
+🔗 Open detailed Media Information
+```
+
+The linked Telegraph page contains the detailed report, including:
+
+- Human-readable file size
+- Human-readable duration
+- Container / format
+- Overall bitrate
+- Stream count
+- Individual stream sizes
+- Codec and full codec name
+- Codec profile
+- Language
+- Title
+- Resolution
+- Pixel format
+- Bit depth
+- FPS
+- Color information
+- Channels / channel layout
+- Sample rate
+- Stream bitrate
+- Default / forced / original flags
+
+The Telegraph API provides `createPage` for creating the detailed page.
+
+## 🖼️ Screenshots
+
+### Automatic Screenshots
+
+Choose **Screenshots**, then enter a count from **1 to 20**.
+
+The bot distributes the screenshots across the video's duration.
+
+### Manual Shots
+
+Choose **Manual Shots**, then send timestamps separated by commas:
+
+```text
+00:05:30, 00:12:10, 00:25:00
+```
+
+Maximum: **20 screenshots**.
+
+## 🧰 Installation
+
+### Prerequisites
+
+- Linux VPS/server
+- Python 3.12+
+- FFmpeg + FFprobe
+- Telegram API ID/hash
+- Telegram bot token
+- Optional GoFile API token
+
+### Get Telegram credentials
+
+1. Create an application at [my.telegram.org](https://my.telegram.org).
+2. Obtain `API_ID` and `API_HASH`.
+3. Create the bot with [@BotFather](https://t.me/BotFather).
+4. Obtain `BOT_TOKEN`.
+
+The application uses Telethon's MTProto client and starts the bot account with its bot token. It does **not** use `api.telegram.org/bot...` or the Local Bot API Server for file transfers.
+
+Telethon documents `download_media()` and `send_file()` with asynchronous progress callbacks.Telethon documentation: https://docs.telethon.dev/en/stable/quick-references/client-reference.html
+
+### Docker — recommended
 
 ```bash
+git clone <your-repository>
+cd media-tools-bot
+cp .env.example .env
+nano .env
 docker compose up -d --build
 ```
 
-The bot container contains FFmpeg/FFprobe and archive tools. There is **no `telegram-bot-api` service**.
+Check logs:
 
-## VPS without Docker
+```bash
+docker compose logs -f
+```
 
-Install:
+### VPS without Docker
+
+Ubuntu/Debian example:
 
 ```bash
 sudo apt update
-sudo apt install -y ffmpeg p7zip-full unar python3 python3-venv
+sudo apt install -y ffmpeg python3 python3-venv p7zip-full unrar
+
 python3 -m venv .venv
-. .venv/bin/activate
+source .venv/bin/activate
 pip install -r requirements.txt
+
 cp .env.example .env
 nano .env
+
 python -m app
 ```
 
-## Large files
-
-MTProto removes the normal HTTP Bot API's 20 MB download / 50 MB upload limitations. Telegram still has its own MTProto-side file and account limits, so the bot does not claim that literally unlimited files can be uploaded to Telegram. GoFile is available as the alternate destination.
-
-## Progress
-
-Telegram download/upload callbacks are supplied directly to Telethon. The callback updates a Telegram status message every `PROGRESS_INTERVAL` seconds and checks the user's cancellation event. GoFile uses a streaming multipart payload that reports bytes written without loading the entire file into RAM.
-
-## Tests
-
-Install test dependencies with `pip install -r requirements-dev.txt`, then run `pytest -q`.
-
-The repository includes offline tests for:
-
-- FFprobe
-- FFmpeg remuxing/conversion/trim/sample/screenshots/splitting/audio filters
-- ZIP extraction and archive traversal protection
-- streaming multipart upload payload and progress callback
-- filename/progress helpers
-- source compilation/import checks
-
-A live Telegram test requires the deployer's own API ID, API hash and bot token, so those credentials are never included in the repository.
-
-## Verification notes
-
-This package is intentionally MTProto-only. The bot uses `TelegramClient(..., API_ID, API_HASH)` and `start(bot_token=BOT_TOKEN)`; it does not configure `api.telegram.org/bot...` or a Local Bot API server.
-
-Telethon 1.44.0 documents asynchronous `progress_callback(current, total)` support for both `download_media()` and `send_file()`. `cryptg` is optional and is installed opportunistically in Docker for faster MTProto encryption/decryption; the bot remains installable without it.
-
-The offline test suite validates media operations, progress rendering, streaming GoFile multipart upload, cancellation cleanup, archive safety, UI callback sizes, and Python compilation. A real Telegram MTProto transfer cannot be performed in an isolated build environment without the deployer's credentials and Telegram network access, so the package does not claim a live-transfer test that was not actually performed.
-
-
-## Direct / Stream Links
-
-The **Make Direct/Stream Link** feature is now served by the bot itself instead of relying on a GoFile direct-link field that may not be available for guest accounts. The HTTP endpoint uses `aiohttp.web.FileResponse`, so browsers can stream media and use HTTP Range requests.
-
-Set: 
+## 🔐 Environment variables
 
 ```env
-PUBLIC_BASE_URL=https://your-public-domain.example
+API_ID=123456
+API_HASH=your_api_hash
+BOT_TOKEN=123456:your_bot_token
+
+# Leave empty for GoFile guest uploads.
+GOFILE_API_TOKEN=
+
+SUDO_USERS=123456789
+
+DOWNLOAD_DIR=/data/downloads
+WORK_DIR=/data/work
+DB_PATH=/data/bot.sqlite3
+
+MAX_CONCURRENT_JOBS=10
+PROGRESS_INTERVAL=3
+SESSION_TIMEOUT=21600
+
+# Direct / Stream Link server
+PUBLIC_BASE_URL=
+WEB_HOST=0.0.0.0
 WEB_PORT=8080
 DIRECT_LINK_TTL=86400
+
+# Optional Telegraph access token
+TELEGRAPH_ACCESS_TOKEN=
 ```
 
-`PUBLIC_BASE_URL` must point to this bot's HTTP service. On a VPS, put Nginx/Caddy/Cloudflare in front of port 8080 if desired. On Railway, use the service's public domain and let `WEB_PORT` fall back to Railway's `PORT` when `WEB_PORT` is not set.
+### Direct-link public URL
 
-## Media Information
+For Railway/Render, the application can use the platform's standard public URL environment variables automatically.
 
-The exact per-stream payload calculation intentionally runs only when Media Information is requested because FFprobe must inspect packets; this can take longer on multi-gigabyte files but avoids slowing every normal media operation.
+For a VPS, configure:
 
+```env
+PUBLIC_BASE_URL=https://media.example.com
+WEB_PORT=8080
+```
 
-Media Information creates a formatted Telegra.ph page with file size, format, duration, bitrate and per-stream codec/language/title/resolution/FPS/channels/sample-rate/bitrate/default/forced information, then sends the page link in Telegram. The Telegraph API documents `createAccount` and `createPage` for this workflow.
+The domain must route to the bot's HTTP service. A reverse proxy such as Caddy or Nginx can terminate HTTPS.
 
-## Stream source preservation
+## 📦 Project structure
 
-Extracting a subtitle/audio/video stream no longer replaces the source used by the Stream Remover/Extractor menus. This prevents a common failure where extracting an SRT caused later video operations to inspect only the SRT file. Video-only operations automatically fall back to the preserved source video.
+```text
+app/
+├── main.py                 # Telegram event routing + workflows
+├── config.py               # Environment configuration
+├── storage/
+│   └── db.py               # SQLite state/settings
+├── services/
+│   ├── ffmpeg.py           # Media processing
+│   ├── ffprobe.py          # Stream inspection
+│   ├── merge.py            # Track muxing
+│   ├── gofile.py            # GoFile upload
+│   ├── telegraph.py         # Detailed media reports
+│   ├── downloader.py       # HTTP/HTTPS downloads
+│   ├── direct.py            # Direct-link helpers
+│   ├── archive.py           # Archive extraction
+│   └── process_control.py   # Cancellable FFmpeg/merge process registry
+├── ui/
+│   ├── keyboards.py        # Inline keyboards
+│   └── text.py             # UI text
+└── utils/
+    ├── files.py
+    └── progress.py
+```
 
-## Merge Tracks
+## 🧪 Testing
 
-`🔀 Merge Tracks` accepts multiple Telegram media files and muxes all their streams into one MKV container without re-encoding. This supports combinations such as:
+Install development dependencies:
 
-- video + video
-- video + multiple audio tracks
-- video + subtitles
-- video + audio + subtitles
+```bash
+pip install -r requirements-dev.txt
+```
 
-This is **track/container merging**, not timeline concatenation.
+Run:
 
-## Progress completion
+```bash
+pytest -q
+```
 
-Transfer progress messages are finalized into a plain completion message and the Cancel button is removed after a successful transfer. This prevents the old completed progress message from remaining actionable.
+The test suite covers:
 
-## Help
+- Python compilation/import contracts
+- FFmpeg/FFprobe media operations
+- Stream-copy sample generation
+- Merge regression cases
+- URL routing
+- Telegram MTProto transfer contracts
+- GoFile multipart payloads and folder reuse
+- Progress throttling
+- Cancellation state
+- UI callback routing
+- Settings persistence
+- Sudo controls
+- Screenshot limits
+- Rename/upload workflow
+- Session timeout behavior
+- Direct-link Range serving
+- Archive safety
 
-`/help` now provides a dedicated feature/command guide instead of opening the main function menu.
+A real Telegram or GoFile production transfer requires the deployment's own credentials and external network access. Those credentials are never included in the repository.
 
-## Merge Tracks workflow
+## 🧠 Design principles
 
-Merge is now a simple queue: after choosing **Merge Tracks**, the current media is immediately counted as file 1. Send additional Telegram media or HTTP(S) URLs directly; captioned Telegram audio/document messages are routed into the merge collector instead of being mistaken for text. The UI shows the live **Files queued** count and **Finish Merge**, **Cancel Merge**, and **Back** buttons. The queue is validated from a snapshot, so inputs are never duplicated during validation.
+### No unnecessary re-encoding
 
-## GoFile folder reuse
+Operations such as stream removal, optimization and merging use FFmpeg stream copy whenever possible.
 
-GoFile uploads reuse one destination folder per user. The first upload without a configured token creates the guest account/folder and persists the returned guest token and parent folder. Subsequent files are uploaded with the same `folderId`, so split/archive batches are kept together instead of creating a new folder for every file. `/cleargofile` clears the saved token and folder and returns to guest mode on the next upload. This follows GoFile's current API documentation, which explicitly supports reusing `folderId` for subsequent uploads.
+Sample generation also uses stream copy into MKV instead of re-encoding a large HEVC source, reducing CPU/RAM pressure on VPS/Railway deployments.
 
-## Human-readable media information
+### Large-file friendly
 
-Media Information displays duration as `HH:MM:SS`/`MM:SS`, file and per-stream payload sizes using B/KiB/MiB/GiB, and bitrates using bps/kb/s/Mb/s/Gb/s. The Telegraph detail page uses the same readable units while retaining detailed codec/stream metadata.
+Transfers are streamed through Telethon/HTTP rather than loading entire files into Python memory.
+
+### State isolation
+
+Each Telegram user has an independent workflow state. Per-user concurrency is one, while a global semaphore protects the host from excessive simultaneous processing.
+
+### Cleanup by lifecycle
+
+Files remain available while the user is actively working. Completed uploads are cleaned immediately; abandoned sessions expire after six hours.
+
+## ⚠️ Important limits
+
+"Supports large files" does not mean an infinite Telegram limit. Telegram's current MTProto-side limits and the limits of the selected Telegram account still apply.
+
+GoFile guest/standard storage is temporary; consult the current GoFile service documentation for retention and traffic limits.
+
+## 📚 Current API references
+
+- [Telegram Bot API](https://core.telegram.org/bots/api) — callback/message editing and deletion semantics.
+- [aiogram documentation](https://docs.aiogram.dev/) — relevant Telegram Bot API method behavior.
+- [Telethon documentation](https://docs.telethon.dev/) — MTProto client and transfer APIs.
+- [GoFile API](https://gofile.io/api) — upload and `folderId` reuse.
+- [Telegraph API](https://telegra.ph/api) — detailed report pages.
+- [FFmpeg documentation](https://ffmpeg.org/documentation.html)
+
+## 📄 License
+
+Add the license appropriate for your distribution before publishing this repository publicly.

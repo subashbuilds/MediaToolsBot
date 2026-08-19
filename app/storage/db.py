@@ -14,6 +14,7 @@ class DB:
             gofile_token TEXT,
             gofile_folder_id TEXT,
             rename_file INTEGER NOT NULL DEFAULT 0,
+            upload_mode TEXT NOT NULL DEFAULT 'choose',
             username TEXT,
             first_name TEXT,
             last_name TEXT,
@@ -24,7 +25,7 @@ class DB:
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)").fetchall()}
         if "gofile_folder_id" not in columns:
             self.conn.execute("ALTER TABLE users ADD COLUMN gofile_folder_id TEXT")
-        for column, definition in (("username", "TEXT"), ("first_name", "TEXT"), ("last_name", "TEXT"), ("first_seen_at", "TEXT")):
+        for column, definition in (("username", "TEXT"), ("first_name", "TEXT"), ("last_name", "TEXT"), ("first_seen_at", "TEXT"), ("upload_mode", "TEXT NOT NULL DEFAULT 'choose'")):
             if column not in columns:
                 self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         self.conn.execute("""CREATE TABLE IF NOT EXISTS direct_links(
@@ -91,6 +92,32 @@ class DB:
         self.ensure(user_id)
         self.conn.execute("UPDATE users SET rename_file=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (int(enabled), user_id))
         self.conn.commit()
+
+
+    def get_upload_mode(self, user_id: int) -> str:
+        self.ensure(user_id)
+        row = self.conn.execute("SELECT upload_mode FROM users WHERE user_id=?", (user_id,)).fetchone()
+        mode = (row[0] if row and row[0] else "choose").lower()
+        return mode if mode in {"choose", "telegram", "gofile"} else "choose"
+
+    def set_upload_mode(self, user_id: int, mode: str) -> None:
+        if mode not in {"choose", "telegram", "gofile"}:
+            raise ValueError("upload mode must be choose, telegram or gofile")
+        self.ensure(user_id)
+        self.conn.execute("UPDATE users SET upload_mode=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (mode, user_id))
+        self.conn.commit()
+
+    def all_users(self) -> list[int]:
+        return [int(r[0]) for r in self.conn.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()]
+
+    def find_user(self, identifier: str) -> int | None:
+        value = identifier.strip()
+        if value.startswith("@"): value = value[1:]
+        if value.isdigit():
+            row = self.conn.execute("SELECT user_id FROM users WHERE user_id=?", (int(value),)).fetchone()
+            return int(row[0]) if row else None
+        row = self.conn.execute("SELECT user_id FROM users WHERE lower(username)=lower(?)", (value,)).fetchone()
+        return int(row[0]) if row else None
 
     def add_direct_link(self, token: str, user_id: int, path: str, expires_at: int) -> None:
         self.conn.execute(
