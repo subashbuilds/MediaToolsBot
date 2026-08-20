@@ -7,7 +7,7 @@ def test_mtproto_transport_contract():
     assert 'await self.client.start(bot_token=self.cfg.bot_token)' in source
     assert 'progress_callback=cb' in source
     assert 'download_media(event.message' in source
-    assert 'send_file(\n                    chat_id' in source
+    assert 'await self.client.send_file(' in source
     assert 'api.telegram.org/bot' not in source
     assert 'telegram-bot-api' not in source
     assert 'USE_LOCAL_BOT_API' not in source

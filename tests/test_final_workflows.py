@@ -9,8 +9,9 @@ def labels(rows):
     return [b.text for row in rows for b in row]
 
 
-def test_media_menu_has_no_url_uploader():
-    assert not any("Url Uploader" in x or "URL Uploader" in x for x in labels(main_menu()))
+def test_media_menu_has_url_uploader_and_no_shortener():
+    assert any("URL Uploader" in x for x in labels(main_menu()))
+    assert not any("Short" in x or "Unshort" in x for x in labels(main_menu()))
 
 
 def test_settings_shows_selected_values():
@@ -75,11 +76,12 @@ def test_gofile_completion_does_not_emit_folder_link():
     assert 'downloadPage' in source
 
 
-def test_cancel_keeps_file_cleanup_separate():
+def test_cancel_deletes_temporary_files_but_direct_links_are_protected():
     source = Path("app/main.py").read_text()
     cancel_block = source[source.index('async def cancel('):source.index('async def start_web_server', source.index('async def cancel('))]
-    assert 'cleanup_user_files' not in cancel_block
+    assert 'cleanup_user_files(uid)' in cancel_block
     assert 'clear_status_message(uid, delete=True)' in cancel_block
+    assert 'active_direct_paths' in source
 
 
 def test_timeout_deletes_server_files_and_returns_start_button():

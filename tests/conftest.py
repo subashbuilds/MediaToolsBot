@@ -16,6 +16,8 @@ if importlib.util.find_spec('telethon') is None:
     telethon.Button = FakeButton
     telethon.TelegramClient = FakeClient
     telethon.events = types.SimpleNamespace(NewMessage=object, CallbackQuery=object)
+    telethon.types = types.SimpleNamespace(ReactionEmoji=lambda emoticon: types.SimpleNamespace(emoticon=emoticon))
+    telethon.functions = types.SimpleNamespace(messages=types.SimpleNamespace(SendReactionRequest=lambda **kwargs: types.SimpleNamespace(**kwargs)))
     errors = types.ModuleType('telethon.errors')
     errors.MessageNotModifiedError = type('MessageNotModifiedError', (Exception,), {})
     custom_message = types.ModuleType('telethon.tl.custom.message')
@@ -24,6 +26,7 @@ if importlib.util.find_spec('telethon') is None:
     tl_custom.message = custom_message
     tl = types.ModuleType('telethon.tl')
     tl.custom = tl_custom
+    telethon.tl = tl
     sys.modules.update({
         'telethon': telethon,
         'telethon.errors': errors,

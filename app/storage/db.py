@@ -15,6 +15,8 @@ class DB:
             gofile_folder_id TEXT,
             rename_file INTEGER NOT NULL DEFAULT 0,
             upload_mode TEXT NOT NULL DEFAULT 'choose',
+            telegram_mode TEXT NOT NULL DEFAULT 'document',
+            custom_thumbnail_path TEXT,
             username TEXT,
             first_name TEXT,
             last_name TEXT,
@@ -25,7 +27,7 @@ class DB:
         columns = {row[1] for row in self.conn.execute("PRAGMA table_info(users)").fetchall()}
         if "gofile_folder_id" not in columns:
             self.conn.execute("ALTER TABLE users ADD COLUMN gofile_folder_id TEXT")
-        for column, definition in (("username", "TEXT"), ("first_name", "TEXT"), ("last_name", "TEXT"), ("first_seen_at", "TEXT"), ("upload_mode", "TEXT NOT NULL DEFAULT 'choose'")):
+        for column, definition in (("username", "TEXT"), ("first_name", "TEXT"), ("last_name", "TEXT"), ("first_seen_at", "TEXT"), ("upload_mode", "TEXT NOT NULL DEFAULT 'choose'"), ("telegram_mode", "TEXT NOT NULL DEFAULT 'document'"), ("custom_thumbnail_path", "TEXT")):
             if column not in columns:
                 self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
         self.conn.execute("""CREATE TABLE IF NOT EXISTS direct_links(
@@ -106,6 +108,33 @@ class DB:
         self.ensure(user_id)
         self.conn.execute("UPDATE users SET upload_mode=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (mode, user_id))
         self.conn.commit()
+
+
+    def get_telegram_mode(self, user_id: int) -> str:
+        self.ensure(user_id)
+        row = self.conn.execute("SELECT telegram_mode FROM users WHERE user_id=?", (user_id,)).fetchone()
+        mode = (row[0] if row and row[0] else "document").lower()
+        return mode if mode in {"document", "media"} else "document"
+
+    def set_telegram_mode(self, user_id: int, mode: str) -> None:
+        if mode not in {"document", "media"}:
+            raise ValueError("telegram mode must be document or media")
+        self.ensure(user_id)
+        self.conn.execute("UPDATE users SET telegram_mode=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (mode, user_id))
+        self.conn.commit()
+
+    def get_thumbnail(self, user_id: int) -> str | None:
+        self.ensure(user_id)
+        row = self.conn.execute("SELECT custom_thumbnail_path FROM users WHERE user_id=?", (user_id,)).fetchone()
+        return row[0] if row and row[0] else None
+
+    def set_thumbnail(self, user_id: int, path: str | None) -> None:
+        self.ensure(user_id)
+        self.conn.execute("UPDATE users SET custom_thumbnail_path=?, updated_at=CURRENT_TIMESTAMP WHERE user_id=?", (path, user_id))
+        self.conn.commit()
+
+    def user_count(self) -> int:
+        return int(self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0])
 
     def all_users(self) -> list[int]:
         return [int(r[0]) for r in self.conn.execute("SELECT user_id FROM users ORDER BY user_id").fetchall()]

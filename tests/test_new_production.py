@@ -65,9 +65,8 @@ def test_start_has_sudo_ongoing_button_and_same_message_rendering_source():
 
 def test_gofile_completion_is_rendered_into_existing_progress_message():
     source = Path('app/main.py').read_text()
-    assert 'await self.safe_edit(status, "\\n\\n".join(text_parts)' in source
-    assert 'await self.client.send_message(chat_id, "\\n\\n".join(text_parts)' not in source
-
+    assert 'await self.safe_edit(status, "\\n".join(lines)' in source
+    assert 'await self.client.send_message(chat_id, "\\n".join(lines)' not in source
 
 def test_timeout_cleanup_contract():
     source = Path('app/main.py').read_text()

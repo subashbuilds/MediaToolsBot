@@ -66,3 +66,14 @@ def test_multitrack_streams_and_merge(tmp_path):
     merged = probe(out)
     assert sum(s.get("codec_type") == "video" for s in merged["streams"]) >= 2
     assert sum(s.get("codec_type") == "audio" for s in merged["streams"]) >= 3
+
+
+def test_sample_uses_stream_copy_and_is_valid(tmp_path):
+    src = tmp_path / "source.mkv"
+    out = tmp_path / "sample.mkv"
+    make_media(src)
+    from app.services.ffmpeg import sample
+    sample(src, out, 1)
+    data = probe(out)
+    assert out.exists() and out.stat().st_size > 0
+    assert any(s.get("codec_type") == "video" for s in data.get("streams", []))

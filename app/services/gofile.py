@@ -8,6 +8,7 @@ from aiohttp import payload
 
 
 UPLOAD_ENDPOINT = "https://upload.gofile.io/uploadfile"
+CREATE_FOLDER_ENDPOINT = "https://api.gofile.io/contents/createFolder"
 
 
 class ProgressFilePayload(payload.Payload):
@@ -42,6 +43,31 @@ class ProgressFilePayload(payload.Payload):
                         await result
 
 
+async def _json_request(session, method: str, url: str, *, token: str | None, payload_data: dict) -> dict:
+    headers = {"Authorization": f"Bearer {token}"} if token else {}
+    async with session.request(method, url, json=payload_data, headers=headers) as r:
+        text = await r.text()
+        if r.status >= 400:
+            raise RuntimeError(f"GoFile HTTP {r.status}: {text[:500]}")
+        try:
+            obj = await r.json(content_type=None)
+        except Exception as exc:
+            raise RuntimeError(f"GoFile returned invalid JSON: {text[:500]}") from exc
+        if obj.get("status") != "ok":
+            raise RuntimeError(str(obj))
+        return obj.get("data", obj)
+
+
+async def create_folder(parent_folder_id: str, folder_name: str, token: str | None = None) -> dict:
+    """Create a child folder using the documented GoFile contents API."""
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await _json_request(
+            session, "POST", CREATE_FOLDER_ENDPOINT, token=token,
+            payload_data={"parentFolderId": parent_folder_id, "folderName": folder_name, "public": True},
+        )
+
+
 async def upload_gofile(
     path: Path,
     token: str | None = None,
@@ -49,18 +75,10 @@ async def upload_gofile(
     progress=None,
     cancel_event: asyncio.Event | None = None,
 ) -> dict:
-    """Upload one file to GoFile, optionally reusing an existing folder.
-
-    Per the current GoFile API documentation, omitting folderId creates a new
-    public folder. Reusing the returned parentFolder/folderId puts subsequent
-    uploads into the same folder. A returned guestToken can likewise be reused
-    for guest-account uploads.
-    """
     if not path.is_file():
         raise FileNotFoundError(path)
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=600)
     headers = {"Authorization": f"Bearer {token}"} if token else {}
-
     async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
         mp = aiohttp.MultipartWriter("form-data")
         if folder_id:
@@ -82,3 +100,20 @@ async def upload_gofile(
             if not isinstance(result, dict):
                 raise RuntimeError(f"Unexpected GoFile response: {result!r}")
             return result
+
+async def delete_content(content_id: str, token: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await _json_request(
+            session, "DELETE", "https://api.gofile.io/contents", token=token,
+            payload_data={"contentsId": content_id},
+        )
+
+
+async def move_content(content_id: str, folder_id: str, token: str) -> dict:
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        return await _json_request(
+            session, "PUT", "https://api.gofile.io/contents/move", token=token,
+            payload_data={"contentsId": content_id, "folderId": folder_id},
+        )
