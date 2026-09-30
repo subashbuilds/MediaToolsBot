@@ -4,19 +4,26 @@ import asyncio
 import contextlib
 import ipaddress
 import os
+import shutil
 import socket
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import aiohttp
 
-from ..utils.files import safe_filename, unique_path
+from ..utils.files import format_bytes, safe_filename, unique_path
 
 CHUNK = 1024 * 1024
-# Default ceiling for a single URL download. Without it a malicious or broken
-# link could fill the container's disk and take the whole bot down.
-MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", str(2048 * 1024 * 1024)))
+# 0 = unlimited. The old 2 GiB default was wrong: it is Telegram's *upload*
+# limit, not a download limit, and it silently rejected perfectly good large
+# files. Disk exhaustion is guarded by the free-space check below instead of
+# an arbitrary size cap, so a huge file is allowed exactly as long as it fits.
+MAX_DOWNLOAD_BYTES = int(os.environ.get("MAX_DOWNLOAD_BYTES", "0"))
 MAX_REDIRECTS = 5
+# Refuse to start when the destination volume has less than this free, so a
+# multi-hundred-GiB download fails fast with a clear message instead of
+# filling the disk and taking the whole bot down mid-write.
+MIN_FREE_BYTES = int(os.environ.get("MIN_FREE_BYTES", str(512 * 1024 * 1024)))
 
 CONTENT_TYPE_EXT = {
     "video/mp4": ".mp4", "video/x-matroska": ".mkv", "video/webm": ".webm",
@@ -122,6 +129,19 @@ async def _read_chunk_or_cancel(stream, size: int, cancel_event: asyncio.Event |
                 await task
 
 
+def _check_free_space(dest_dir: Path, needed: int) -> None:
+    """Fail fast when the download cannot possibly fit on disk."""
+    try:
+        free = shutil.disk_usage(dest_dir).free
+    except OSError:
+        return  # unknown filesystem (e.g. some FUSE mounts): do not block
+    if needed and free < needed + MIN_FREE_BYTES:
+        raise DownloadError(
+            f"Not enough free disk space: {format_bytes(free)} available, "
+            f"{format_bytes(needed)} needed."
+        )
+
+
 async def download_url(
     url: str,
     dest_dir: Path,
@@ -179,6 +199,8 @@ async def _download_once(url, dest_dir, progress, cancel_event, limit, timeout, 
                 raise DownloadError(
                     f"File is too large ({total / 1024**3:.2f} GiB). The limit is {limit / 1024**3:.0f} GiB."
                 )
+            if total:
+                _check_free_space(dest_dir, total)
             current = 0
             try:
                 with out.open("wb") as f:
@@ -193,6 +215,11 @@ async def _download_once(url, dest_dir, progress, cancel_event, limit, timeout, 
                             raise DownloadError(
                                 f"Download exceeded the {limit / 1024**3:.0f} GiB limit and was stopped."
                             )
+                        # Content-Length is frequently absent or wrong, so the
+                        # free-space guard is re-checked while writing rather
+                        # than trusted up front.
+                        if not total and current % (256 * 1024 * 1024) == 0:
+                            _check_free_space(dest_dir, 0)
                         f.write(chunk)
                         if progress:
                             await progress(current, total)

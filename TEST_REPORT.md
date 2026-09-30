@@ -8,7 +8,7 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-122 passed
+147 passed
 
 python -m compileall -q app tests
 PASS
@@ -52,6 +52,18 @@ PASS (only the intentional `import cryptg` availability probe)
 - **Background download queue**: parallelism limits, pausing during jobs, cancellation, duplicate/missing-file handling, and the rule that a running job keeps its input file
 - **Bulk mode**: queue model, rendering, and a scripted end-to-end session (enable bulk → send three files → Done Adding → Upload All) driven against a fake Telegram client
 - **Real HTTP download through the background worker** against a local aiohttp server
+- **Telegram-faithful UI semantics** (`tests/test_ui_semantics.py`): a fake client that raises
+  `MessageNotModifiedError` on an unchanged edit and returns `None` for a deleted message, covering
+  re-render behaviour, card recovery after deletion, mid-download action handling, menu placement,
+  user-keyed status state, stale-button feedback, and a full scripted user journey
+
+### Why the first pass missed the interface bugs
+
+The original fake Telegram client never raised `MessageNotModifiedError` and never returned `None`
+for a deleted message, so it could not reproduce the two failures users actually hit. Every
+"screen re-render" test passed against a fake that always reported success. `tests/test_ui_semantics.py`
+models both behaviours explicitly. Any future UI change should use that client rather than the
+optimistic one.
 
 ## Bugs fixed in this pass
 
@@ -86,6 +98,45 @@ Each of these had a reproduction or a code-level proof:
 | `ffprobe` | No timeout, no cache | A corrupt container could hang the process |
 | Database | No lock, write per message | SQLite contention under load |
 | Config | Any malformed env var aborted boot | A typo took the whole bot down |
+
+## Bugs fixed after the first deployment feedback
+
+These were reported by users against the deployed bot. Every one is now covered by a test that
+fails without the fix.
+
+| Area | Problem | Effect |
+|---|---|---|
+| `safe_edit` | `MessageNotModifiedError` was swallowed and returned as `None`, which callers read as "edit failed" | Every re-render of an identical screen **sent a brand-new message** — the chat filled with duplicate menus |
+| `answer()` | `event.respond(text, alert=...)` — Telethon's `respond` has no `alert` parameter | `TypeError` was swallowed, so **every toast in the bot silently did nothing** |
+| Card placement | `render_card` fell back to the previous card's ids after a new input | The new menu rendered **above** the file instead of below it |
+| `await_input` | Actions checked `st.path` before the background download finished | "Send a media file first" **even though the bot was already downloading the file** |
+| `video_media` | `ffprobe` ran synchronously on the event loop and any error collapsed to `None` | A slow probe froze the whole bot, and any hiccup produced "Send a video first" |
+| `new_status_message` | Keyed its state by `chat_id` while `clear_status_message`/`progress_message` keyed by `uid` | In groups, status messages were never deleted and progress edits went to the wrong user |
+| `run_trim` | Validated `st.path` before calling `await_input` | Rejected a valid trim request while the file was still downloading |
+| Audio filters | `run_audio_convert`/`run_audio_filter` never waited and replied with `send_message` | Claimed no file existed, and added an extra message per attempt |
+| Reply routing | Many validation replies used `client.send_message` instead of editing the card | Extra messages accumulated on every error |
+| Telethon API surface | Calls were not checked against the real library signatures | Verified with an AST audit against Telethon 1.44.0: no remaining invalid keyword arguments |
+
+## Bugs fixed in the download / merge / metadata pass
+
+| Area | Problem | Effect |
+|---|---|---|
+| **Merge** | `merge_status_text()` was called from five places but never defined | `AttributeError` on every merge action — **the entire Merge feature was dead** |
+| Merge order | Tracks were joined in download-completion order | Files could be merged in the wrong order with no way to correct it |
+| Download limit | `MAX_DOWNLOAD_MB` defaulted to 2048 | Any file over 2 GiB was refused. That limit is Telegram's **upload** limit and never applied to downloads |
+| Download guard | No protection once the artificial cap was removed | Added a real free-space check that fails fast with a readable message, instead of filling the disk mid-write |
+| Progress throttle | `_should_emit` short-circuited to "always emit" when `total` was unknown | A server without `Content-Length` edited the message on **every chunk** and hit flood-wait. It only looked throttled because the speed text changed each time and defeated the duplicate-text suppression |
+| Stream metadata | Track list was only known after the full download | Added a background `ffprobe` on the link so audio/video tracks are available while the file is still transferring, plus `Remove all audio` / `Keep default audio` actions |
+| Merge order UI | No keyboard for reordering | Added per-track up/down, move-to-top/bottom and remove, with a numbered order screen |
+| `self.*` audit | `pyflakes` cannot see attribute access | Added an AST check: 0 of 113 called methods are undefined |
+
+### Verified against real tools, not mocks
+
+- Remote metadata is read from a real `ffprobe` over HTTP against a live
+  `http.server` serving a genuine 2-audio-track MKV.
+- The Telegram split threshold is asserted against the documented 2 GiB bot limit.
+- The GoFile path is asserted **not** to chunk.
+- The free-space guard is exercised with a real `shutil.disk_usage` reading.
 
 ## External integration boundary
 

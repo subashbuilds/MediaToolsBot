@@ -143,9 +143,42 @@ def cancel_menu():
     return [[Button.inline("Cancel Process", b"cancel")]]
 
 
-def merge_menu():
+def merge_menu(count: int = 0):
     return [
-        [Button.inline("✅ Finish Merge", b"merge:finish")],
+        [Button.inline(f"✅ Finish Merge ({count})" if count else "✅ Finish Merge", b"merge:finish")],
         [Button.inline("❌ Cancel Merge", b"merge:cancel")],
         [Button.inline("⬅️ Back", b"merge:back")],
+    ]
+
+
+def merge_order_menu(count: int):
+    """Keyboard letting the user fix the order before merging.
+
+    Files arrive in whatever order they finish downloading, which is rarely the
+    order the user meant. Each track gets up/down controls so the final
+    sequence is explicit before FFmpeg runs.
+    """
+    rows = []
+    # Telegram allows at most 100 buttons per message; keep the list usable for
+    # a realistic merge set while staying well inside that limit.
+    for idx in range(min(count, 20)):
+        rows.append([
+            Button.inline("⬆️", f"merge:up:{idx}".encode()),
+            Button.inline(f"{idx + 1}. Options", f"merge:pick:{idx}".encode()),
+            Button.inline("⬇️", f"merge:down:{idx}".encode()),
+        ])
+    rows.append([Button.inline(f"✅ Merge {count} files", b"merge:finish")])
+    rows.append([Button.inline("🗑️ Clear all", b"merge:clear"), Button.inline("❌ Cancel", b"merge:cancel")])
+    return rows
+
+
+def merge_pick_menu(position: int, total: int):
+    """Second step: choose what to do with one selected track."""
+    return [
+        [Button.inline("⬆️ Move to top", b"merge:top")],
+        [Button.inline("⬆️ Move up one", b"merge:shift:-1")],
+        [Button.inline("⬇️ Move down one", b"merge:shift:1")],
+        [Button.inline("⬇️ Move to bottom", b"merge:bottom")],
+        [Button.inline(f"🗑️ Remove #{position + 1}", b"merge:drop")],
+        [Button.inline(f"⬅️ Back to order ({total})", b"merge:order")],
     ]

@@ -11,7 +11,11 @@ load_dotenv()
 # 1080p transcodes. The FFmpeg semaphore is sized from the container limit when
 # /sys/fs/cgroup is readable so a small VPS does not get OOM-killed.
 DEFAULT_FFMPEG_JOBS = 2
-DEFAULT_MAX_DOWNLOAD_MB = 2048
+# 0 means "no artificial ceiling". The 2 GiB Bot API upload limit applies only
+# to *sending* to Telegram, never to downloading, so downloads are unrestricted
+# unless the operator opts in with MAX_DOWNLOAD_MB. Disk exhaustion is still
+# guarded at request time by a free-space check in the downloader.
+DEFAULT_MAX_DOWNLOAD_MB = 0
 
 
 def _int(name: str, default: int) -> int:
@@ -142,7 +146,7 @@ class Config:
             db_path=Path(os.getenv("DB_PATH", "/data/bot.sqlite3")),
             max_concurrent_jobs=max(1, _int("MAX_CONCURRENT_JOBS", 10)),
             max_ffmpeg_jobs=ffmpeg_jobs,
-            max_download_mb=max(1, _int("MAX_DOWNLOAD_MB", DEFAULT_MAX_DOWNLOAD_MB)),
+            max_download_mb=max(0, _int("MAX_DOWNLOAD_MB", DEFAULT_MAX_DOWNLOAD_MB)),
             max_parallel_downloads=max(1, min(8, _int("MAX_PARALLEL_DOWNLOADS", 3))),
             progress_interval=max(1.0, _float("PROGRESS_INTERVAL", 3)),
             sudo_users=_str_ids("SUDO_USERS"),

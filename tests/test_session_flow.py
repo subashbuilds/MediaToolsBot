@@ -154,7 +154,9 @@ def test_unknown_callback_falls_back_to_a_working_screen(tmp_path):
     async def scenario():
         event = FakeEvent(uid, "video:stale_button")
         await bot.callback_router(event, uid, "video:stale_button")
-        assert event.responses, "the user must be told the button expired"
+        # A toast (`event.answer`) is the right channel here: it appears above
+        # the chat without adding another message to the conversation.
+        assert event.answers or event.responses, "the user must be told the button expired"
         assert client.sent, "a fresh menu is sent"
 
     asyncio.run(scenario())

@@ -22,7 +22,7 @@ from .storage.db import DB
 from .ui.keyboards import (
     admin_menu, archive_collect_menu, archive_mode_menu, archive_password_menu,
     audio_menu, bulk_menu, bulk_upload_menu, cancel_menu, main_menu, merge_menu,
-    rename_menu, settings_menu, upload_menu, video_menu,
+    merge_order_menu, merge_pick_menu, rename_menu, settings_menu, upload_menu, video_menu,
 )
 from .services import ffmpeg, ffprobe
 from .services.archive import extract_archive, is_archive, archive_requires_password, multipart_info
@@ -39,6 +39,9 @@ from telethon import functions, types
 from .services import process_control
 
 log = logging.getLogger("media-tools")
+
+# Sentinel: Telegram accepted the edit request but the content was identical.
+UNCHANGED = object()
 
 URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}]+", re.I)
 PHOTO_SUFFIX = ".jpg"
@@ -98,6 +101,8 @@ class UserState:
     task: asyncio.Task | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     merge_inputs: list[Path] = field(default_factory=list)
+    # Index of the track the user is currently reordering in the merge screen.
+    merge_selected: int = 0
     ui_message_id: int | None = None
     ui_chat_id: int | None = None
     last_activity: float = field(default_factory=time.monotonic)
@@ -122,11 +127,15 @@ class UserState:
     # -- background download pipeline -----------------------------------
     queue: DownloadQueue = field(default_factory=DownloadQueue)
     download_tasks: set = field(default_factory=set)
+    probe_tasks: set = field(default_factory=set)
     worker_task: asyncio.Task | None = None
     panel_task: asyncio.Task | None = None
     queue_cancel: asyncio.Event = field(default_factory=asyncio.Event)
     view: str = "start"
     last_reaction: float = 0.0
+    # The single interactive "card" message: always the newest bot message.
+    card_message_id: int | None = None
+    card_chat_id: int | None = None
 
     @property
     def busy(self) -> bool:
@@ -149,7 +158,9 @@ class MediaToolsBot:
         self.web_runner: web.AppRunner | None = None
         self.direct_cleanup_task: asyncio.Task | None = None
         self.sweeper_task: asyncio.Task | None = None
-        self.download_limit = max(1, cfg.max_download_mb) * 1024 * 1024
+        # 0 = unlimited. Telegram's 2 GiB ceiling applies to uploads only, so it must
+        # never gate a download.
+        self.download_limit = cfg.max_download_mb * 1024 * 1024 if cfg.max_download_mb > 0 else 0
 
     def state(self, uid: int) -> UserState:
         if uid not in self.states:
@@ -194,20 +205,19 @@ class MediaToolsBot:
             log.debug("reaction failed for message %s: %s", getattr(event.message, "id", "?"), exc)
 
     async def delete_menu_message(self, uid: int) -> None:
+        """Forget the card reference without deleting anything from chat.
+
+        Messages are no longer removed on navigation: deleting the message the
+        user is currently tapping is what produced the "menu jumped back to
+        home" behaviour.
+        """
         st = self.state(uid)
-        if not st.menu_message_id or not st.menu_chat_id:
-            return
-        try:
-            msg = await self.client.get_messages(st.menu_chat_id, ids=st.menu_message_id)
-            if msg:
-                await msg.delete()
-        except Exception:
-            pass
         st.menu_message_id = None
         st.menu_chat_id = None
+        st.card_message_id = None
+        st.card_chat_id = None
         st.ui_message_id = None
         st.ui_chat_id = None
-        st.view = "start"
 
     def allowed(self, uid: int) -> bool:
         # SUDO_USERS grants elevated controls; it is not a whitelist.
@@ -351,8 +361,10 @@ class MediaToolsBot:
         lines.append("\nOnly one process is allowed per normal user.")
         return "\n".join(lines)
 
-    async def new_status_message(self, chat_id: int, text: str, buttons=None, **kwargs):
-        st = self.state(chat_id)
+    async def new_status_message(self, chat_id: int, text: str, buttons=None, uid: int | None = None, **kwargs):
+        # Keyed by the *user*, matching clear_status_message/progress_message.
+        # Using chat_id here silently split the status state in group chats.
+        st = self.state(uid if uid is not None else chat_id)
         # Delete an older process status before creating another one. This is
         # what prevents multiple stale Cancel Process messages accumulating.
         if st.status_message_id and st.status_chat_id:
@@ -390,23 +402,52 @@ class MediaToolsBot:
             st.status_chat_id = None
 
     async def safe_edit(self, msg: Message, text: str, buttons=None, **kwargs):
-        """Edit a message, tolerating both no-op edits and hard failures.
+        """Edit a message and report the outcome precisely.
 
-        Any exception other than "not modified" is swallowed so a deleted or
-        inaccessible message never aborts the surrounding workflow.
+        Returns:
+            The edited message on success, ``UNCHANGED`` when Telegram said the
+            content was already identical, or ``None`` when the edit genuinely
+            failed (deleted message, not our own, no rights...).
+
+        Collapsing "unchanged" and "failed" into ``None`` was the cause of a
+        large amount of duplicated menu messages: an unchanged screen made the
+        bot send a fresh copy instead of doing nothing.
         """
         try:
             return await msg.edit(text, buttons=buttons, **kwargs)
         except MessageNotModifiedError:
-            return None
+            return UNCHANGED
         except Exception as exc:
             log.debug("edit failed: %s", exc)
             return None
 
-    async def answer(self, event, text: str, alert: bool = False) -> None:
-        """Send a short reply without assuming a message context exists."""
+    @staticmethod
+    def _editable(result) -> bool:
+        """True when the message is still usable as the interactive card."""
+        return result is not UNCHANGED and result is not None
+
+    async def answer_event(self, chat_id: int, text: str) -> None:
         try:
-            await event.respond(text, alert=alert)
+            await self.client.send_message(chat_id, text)
+        except Exception:
+            pass
+
+    async def answer(self, event, text: str, alert: bool = False) -> None:
+        """Show a toast above the chat, falling back to a chat reply.
+
+        ``event.respond()`` has no ``alert`` parameter. Passing one raised
+        TypeError, which the blanket except swallowed, so every toast in the
+        bot silently disappeared and users got no feedback on bulk actions.
+        """
+        try:
+            await event.answer(text, alert=alert)
+            return
+        except TypeError:
+            pass
+        except Exception:
+            log.debug("toast failed", exc_info=True)
+        try:
+            await event.respond(text)
         except Exception:
             pass
 
@@ -529,28 +570,53 @@ class MediaToolsBot:
         except Exception:
             return None
 
-    async def _resolve_ui_message(self, st: UserState, chat_id: int, kind: str, source):
-        """Find the message that should be reused for this screen.
+    async def render_card(
+        self,
+        chat_id: int,
+        uid: int,
+        text: str,
+        buttons=None,
+        parse_mode: str | None = "html",
+        link_preview: bool = False,
+        fresh: bool = False,
+    ):
+        """Render the user's single interactive card.
 
-        Reusing a single message is what keeps the chat free of dozens of
-        near-identical menu messages. When the tracked message is gone (deleted
-        by the user, or a stale id from a previous deploy) ``None`` is
-        returned so the caller sends a fresh one instead of failing.
+        The card is always the newest bot message. ``fresh=True`` sends a new
+        one, which is what happens after the user supplies a new input so the
+        menu ends up *below* their file instead of far above it. Everything
+        else edits the existing card in place, so the chat never fills up with
+        near-identical menus.
         """
-        if source is not None:
-            return source
-        candidates = []
-        if kind == "start":
-            if st.start_message_id and st.start_chat_id:
-                candidates.append((st.start_chat_id, st.start_message_id))
-        else:
-            if st.menu_message_id and st.menu_chat_id:
-                candidates.append((st.menu_chat_id, st.menu_message_id))
-            # Adopt the start dashboard for the first menu so a single message
-            # is reused instead of leaving an orphan behind.
-            if st.start_message_id and st.start_chat_id:
-                candidates.append((st.start_chat_id, st.start_message_id))
-        for cid, mid in candidates:
+        st = self.state(uid)
+        self.touch(uid)
+        # Telethon clears an inline keyboard only when buttons is explicitly
+        # None/[]; omitting the argument silently keeps the old markup.
+        markup = buttons if buttons else []
+        if not fresh:
+            msg = await self._current_card(st, chat_id)
+            if msg is not None:
+                result = await self.safe_edit(msg, text, buttons=markup, parse_mode=parse_mode, link_preview=link_preview)
+                if self._editable(result) or result is UNCHANGED:
+                    st.ui_chat_id = chat_id
+                    st.ui_message_id = msg.id
+                    return msg
+        try:
+            msg = await self.client.send_message(
+                chat_id, text, buttons=markup or None, parse_mode=parse_mode, link_preview=link_preview,
+            )
+        except Exception as exc:
+            log.warning("could not send card: %s", exc)
+            return None
+        st.ui_chat_id = chat_id
+        st.ui_message_id = msg.id
+        st.card_chat_id = chat_id
+        st.card_message_id = msg.id
+        return msg
+
+    async def _current_card(self, st: UserState, chat_id: int):
+        """Fetch the card message, returning None if it is gone."""
+        for cid, mid in self._card_refs(st):
             try:
                 msg = await self.client.get_messages(cid, ids=mid)
             except Exception:
@@ -559,32 +625,45 @@ class MediaToolsBot:
                 return msg
         return None
 
-    async def render_ui(self, chat_id: int, uid: int, text: str, buttons=None, parse_mode=None, link_preview=False, source=None, kind="menu"):
-        st = self.state(uid)
-        if kind != "start":
-            self.touch(uid)
-        msg = await self._resolve_ui_message(st, chat_id, kind, source)
-        if msg is not None:
-            edited = await self.safe_edit(msg, text, buttons=buttons, parse_mode=parse_mode, link_preview=link_preview)
-            if edited is not None:
-                st.view = kind
-                self._remember_ui(st, chat_id, kind, msg)
-                return msg
-            # The message could not be reused (deleted/too old); start fresh.
-        msg = await self.client.send_message(chat_id, text, buttons=buttons, parse_mode=parse_mode, link_preview=link_preview)
-        st.view = kind
-        self._remember_ui(st, chat_id, kind, msg)
-        return msg
+    @staticmethod
+    def _card_refs(st: UserState):
+        refs = []
+        if st.card_message_id and st.card_chat_id:
+            refs.append((st.card_chat_id, st.card_message_id))
+        if st.ui_message_id and st.ui_chat_id:
+            refs.append((st.ui_chat_id, st.ui_message_id))
+        if st.menu_message_id and st.menu_chat_id:
+            refs.append((st.menu_chat_id, st.menu_message_id))
+        return refs
 
-    def _remember_ui(self, st: UserState, chat_id: int, kind: str, msg) -> None:
-        if kind == "start":
-            st.start_chat_id = chat_id
-            st.start_message_id = msg.id
+    async def render_ui(self, chat_id, uid, text, buttons=None, parse_mode=None, link_preview=False, source=None, kind="menu"):
+        """Backwards-compatible wrapper around the card renderer."""
+        if kind != "start":
+            return await self.render_card(chat_id, uid, text, buttons, parse_mode or "html", link_preview)
+        # Start/help screens are their own stable message.
+        st = self.state(uid)
+        if source is not None and getattr(source, "id", None):
+            msg = source
+        elif st.start_message_id and st.start_chat_id:
+            try:
+                msg = await self.client.get_messages(st.start_chat_id, ids=st.start_message_id)
+            except Exception:
+                msg = None
         else:
-            st.menu_chat_id = chat_id
-            st.menu_message_id = msg.id
-            st.ui_chat_id = chat_id
-            st.ui_message_id = msg.id
+            msg = None
+        markup = buttons if buttons else []
+        if msg is not None:
+            result = await self.safe_edit(msg, text, buttons=markup, parse_mode=parse_mode or "html", link_preview=link_preview)
+            if self._editable(result) or result is UNCHANGED:
+                st.start_chat_id = chat_id
+                st.start_message_id = msg.id
+                st.view = kind
+                return msg
+        msg = await self.client.send_message(chat_id, text, buttons=markup or None, parse_mode=parse_mode or "html", link_preview=link_preview)
+        st.start_chat_id = chat_id
+        st.start_message_id = msg.id
+        st.view = kind
+        return msg
 
     async def send_help(self, entity, uid: int, source=None):
         text = (
@@ -632,7 +711,9 @@ class MediaToolsBot:
 
     async def send_start_info(self, entity, uid: int, source=None):
         st = self.state(uid)
-        await self.delete_menu_message(uid)
+        # Never delete the card here: when the user taps Back/Cancel the card is
+        # the very message being clicked, and deleting it left the user staring
+        # at a fresh "home" screen with no explanation of what happened.
         me = await self.client.get_me()
         username = f"@{me.username}" if getattr(me, "username", None) else str(getattr(me, "id", "unknown"))
         buttons = [
@@ -675,7 +756,8 @@ class MediaToolsBot:
             f"🧹 <b>Delete After Upload:</b> {'On' if auto_delete else 'Off'}\n"
             f"📦 <b>Keep Files:</b> {'On — temporary files are preserved' if keep_files else 'Off'}\n"
             f"🖼️ <b>Custom Thumbnail:</b> {'Set' if thumb else 'Not set'}\n\n"
-            f"<i>Parallel downloads: {parallel} • Max download: {self.cfg.max_download_mb} MiB</i>"
+            f"<i>Parallel downloads: {parallel} • Max download: "
+            f"{f'{self.cfg.max_download_mb} MiB' if self.cfg.max_download_mb else 'Unlimited'}</i>"
         )
         return await self.render_ui(
             entity, uid, text,
@@ -895,12 +977,16 @@ class MediaToolsBot:
         finally:
             st.panel_task = None
 
-    async def _render_queue_panel(self, uid: int, chat_id: int, source=None, force: bool = False):
+    async def _render_queue_panel(self, uid: int, chat_id: int, source=None, force: bool = False, fresh: bool = False):
         """Repaint the download screen.
 
         Bulk users get the queue panel with its own keyboard; everyone else
         gets the regular action menu with a download hint above it, so the
         familiar buttons stay in place while the transfer runs.
+
+        ``fresh`` sends a brand new card. That is required for the very first
+        panel after a new input: editing the previous card left the menu
+        stranded far *above* the file the user had just sent.
         """
         st = self.state(uid)
         if not force and st.view != "queue":
@@ -909,16 +995,16 @@ class MediaToolsBot:
         total, done, running, failed = st.queue.summary()
         if not bulk:
             pending = st.queue.pending() + st.queue.running()
-            if pending and not st.path:
+            if pending:
                 lines = ["📥 <b>Downloading…</b>", ""]
                 for entry in pending[:5]:
                     lines.append(f"⏳ <b>{esc(entry.display_name[:50])}</b>")
                 lines += ["", "<i>You can already pick an action below; the download continues in the background.</i>"]
-                return await self.render_ui(chat_id, uid, "\n".join(lines), buttons=main_menu(), parse_mode="html", source=source, kind="menu")
-            return await self.show_file_menu(chat_id, uid, st.path, source=source)
+                return await self.render_card(chat_id, uid, "\n".join(lines), buttons=main_menu(), fresh=fresh)
+            return await self.show_file_menu(chat_id, uid, st.path, fresh=fresh)
         active = st.path.name if st.path else None
         text = render_queue(st.queue, active, bulk=True)
-        return await self.render_ui(chat_id, uid, text, buttons=bulk_menu(done, running), parse_mode="html", source=source, kind="queue")
+        return await self.render_card(chat_id, uid, text, buttons=bulk_menu(done, running), fresh=fresh or bool(force and not st.card_message_id))
 
     async def enqueue_input(self, chat_id: int, uid: int, item: QueueItem, source=None) -> QueueItem:
         """Accept a new input and start downloading it in the background.
@@ -930,7 +1016,15 @@ class MediaToolsBot:
         st.queue.add(item)
         st.view = "queue"
         st.queue_cancel.clear()
-        await self._render_queue_panel(uid, chat_id, source=source, force=True)
+        st.card_message_id = None
+        st.card_chat_id = None
+        # Drop the old card references too, otherwise render_card would edit
+        # the previous screen and the new menu would appear above the file.
+        st.ui_message_id = None
+        st.ui_chat_id = None
+        st.menu_message_id = None
+        st.menu_chat_id = None
+        await self._render_queue_panel(uid, chat_id, source=source, force=True, fresh=True)
         self._ensure_panel(uid)
         if not st.worker_task or st.worker_task.done():
             st.worker_task = asyncio.create_task(self._queue_worker(uid))
@@ -970,7 +1064,13 @@ class MediaToolsBot:
             item.path = path
             st.queue.release(item)
             self._promote_item(st, path, item)
+            # Fill in the track list for anything the remote probe missed.
+            st.probe_tasks.add(asyncio.create_task(self._probe_downloaded_metadata(uid, item)))
+            st.probe_tasks = {t for t in st.probe_tasks if not t.done()}
         except asyncio.CancelledError:
+            task = getattr(item, "probe_task", None)
+            if task is not None and not task.done():
+                task.cancel()
             if item.path is not None:
                 item.path.unlink(missing_ok=True)
             st.queue.mark_failed(item, "cancelled")
@@ -997,9 +1097,63 @@ class MediaToolsBot:
         st.outputs = [path]
         st.streams = []
 
+    async def _probe_item_metadata(self, uid: int, item: QueueItem) -> None:
+        """Populate ``item.streams`` from a remote URL, off the event loop.
+
+        Best effort: any failure leaves the item unprobed and the menus simply
+        fall back to probing the downloaded file later.
+        """
+        if not item.url or item.probed:
+            return
+        item.probed = True
+        try:
+            data = await asyncio.to_thread(ffprobe.safe_probe_remote, item.url)
+        except Exception:
+            log.debug("remote probe failed for %s", item.url, exc_info=True)
+            return
+        streams = data.get("streams") or []
+        if not streams:
+            return
+        item.streams = streams
+        duration = (data.get("format") or {}).get("duration")
+        try:
+            item.duration = float(duration) if duration else None
+        except (TypeError, ValueError):
+            item.duration = None
+        # If this item is already the active one, refresh the live menu so the
+        # user can pick an audio track straight away.
+        st = self.state(uid)
+        if st.path is None or not st.busy:
+            st.streams = streams
+
+    async def _probe_downloaded_metadata(self, uid: int, item: QueueItem) -> None:
+        """Probe a finished local file so the track menus are pre-populated."""
+        if item.probed and item.streams:
+            return
+        path = item.path
+        if path is None or not path.exists():
+            return
+        try:
+            data = await asyncio.to_thread(ffprobe.safe_probe, path)
+        except Exception:
+            log.debug("local probe failed for %s", path, exc_info=True)
+            return
+        streams = data.get("streams") or []
+        if not streams:
+            return
+        item.streams = streams
+        item.probed = True
+        st = self.state(uid)
+        if not st.busy and st.path is not None and st.path == path:
+            st.streams = streams
+
     async def _download_url_item(self, uid: int, item: QueueItem) -> Path:
         st = self.state(uid)
         dest = self.cfg.download_dir / str(uid)
+        # Read the container header over HTTP in parallel with the transfer so
+        # the audio/video track lists are usable straight away.
+        probe_task = asyncio.create_task(self._probe_item_metadata(uid, item))
+        item.probe_task = probe_task
 
         async def cb(current: int, total: int) -> None:
             if st.queue_cancel.is_set():
@@ -1037,7 +1191,7 @@ class MediaToolsBot:
             raise RuntimeError("Telegram returned no downloaded file")
         return out
 
-    async def show_file_menu(self, chat_id: int, uid: int, path: Path | None, source=None, plain: bool = False):
+    async def show_file_menu(self, chat_id: int, uid: int, path: Path | None, source=None, plain: bool = False, fresh: bool = True):
         st = self.state(uid)
         if path is None:
             st.path = st.source_path = st.root_path = None
@@ -1064,19 +1218,9 @@ class MediaToolsBot:
                 "\n\nPlease select your preferred action below 👇"
             )
             buttons = main_menu()
-        # Reuse the message that is already showing the queue so the screen
-        # updates in place instead of leaving a second menu behind.
-        msg = await self._resolve_ui_message(st, chat_id, "menu", source)
-        if msg is not None:
-            edited = await self.safe_edit(msg, text, buttons=buttons, parse_mode="html")
-            if edited is not None:
-                st.menu_chat_id = chat_id
-                st.menu_message_id = msg.id
-                st.ui_chat_id = chat_id
-                st.ui_message_id = msg.id
-                self.touch(uid)
-                return msg
-        return await self.render_ui(chat_id, uid, text, buttons=buttons, parse_mode="html", source=source, kind="menu")
+        # A new input always gets a brand new card, so the menu appears
+        # directly *below* the file the user just sent.
+        return await self.render_card(chat_id, uid, text, buttons=buttons, fresh=bool(fresh))
 
     async def receive_media(self, event):
         uid = event.sender_id
@@ -1147,7 +1291,7 @@ class MediaToolsBot:
     async def process_url(self, chat_id: int, uid: int, url: str):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first.")
+            await self.render_card(chat_id, uid, "⚠️ A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
         st.pending = None
         name = url.rsplit("/", 1)[-1].split("?")[0] or url
@@ -1156,6 +1300,7 @@ class MediaToolsBot:
 
     async def run_archive(self, chat_id, uid, source=None):
         st = self.state(uid)
+        await self.await_input(chat_id, uid)
         path = st.path
         if not path or not path.exists() or not is_archive(path):
             await self.render_ui(chat_id, uid, "❌ Send an archive file first.", buttons=main_menu(), source=source)
@@ -1188,7 +1333,7 @@ class MediaToolsBot:
         outdir = self.cfg.work_dir / str(uid) / f"extracted_{int(time.time())}_{secrets.token_hex(4)}"
         st.pending = None
         st.archive_password = password
-        status = await self.new_status_message(chat_id, "Extracting archive\u2026", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Extracting archive\u2026", uid=uid, buttons=cancel_menu())
         self.begin_job(uid, "Extracting archive")
         try:
             # Extraction is as CPU/disk heavy as a transcode, so it shares the
@@ -1320,7 +1465,7 @@ class MediaToolsBot:
             return
         name = safe_filename(getattr(file, "name", None) or f"archive_part_{getattr(message, 'id', 0)}.bin")
         out = unique_path(self.cfg.download_dir / str(uid) / "archive_parts", name)
-        status = await self.new_status_message(event.chat_id, f"📥 Downloading archive part…\n{esc(name)}", buttons=cancel_menu(), parse_mode="html")
+        status = await self.new_status_message(event.chat_id, f"📥 Downloading archive part…\n{esc(name)}", uid=uid, buttons=cancel_menu(), parse_mode="html")
         reporter = await self.progress_message(status, uid=uid)
         self.begin_job(uid, "Downloading archive part")
         try:
@@ -1345,9 +1490,9 @@ class MediaToolsBot:
     async def process_archive_part_url(self, chat_id: int, uid: int, url: str):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "A process is already running. Wait for it to finish or cancel it.")
+            await self.render_card(chat_id, uid, "A process is already running. Wait for it to finish or cancel it.", buttons=cancel_menu())
             return
-        status = await self.new_status_message(chat_id, "Downloading archive part URL\u2026", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Downloading archive part URL\u2026", uid=uid, buttons=cancel_menu())
         reporter = await self.progress_message(status, uid=uid)
         out = None
         self.begin_job(uid, "Downloading archive part")
@@ -1377,9 +1522,9 @@ class MediaToolsBot:
         """Download an HTTP(S) URL as an additional merge input."""
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
+            await self.render_card(chat_id, uid, "A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
-        status = await self.new_status_message(chat_id, "Downloading merge URL\u2026", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Downloading merge URL\u2026", uid=uid, buttons=cancel_menu())
         reporter = await self.progress_message(status, uid=uid)
         out = None
         self.begin_job(uid, "Downloading merge URL")
@@ -1396,7 +1541,7 @@ class MediaToolsBot:
             st.merge_inputs.append(out.resolve())
             await self.safe_edit(status, f"Added merge URL: {esc(out.name)}\nTracks queued: {len(st.merge_inputs)}", buttons=None, parse_mode="html")
             st.status_message_id = None; st.status_chat_id = None
-            await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
+            await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html")
             self.touch(uid)
         except asyncio.CancelledError:
             if isinstance(out, Path):
@@ -1469,7 +1614,7 @@ class MediaToolsBot:
         if st.pending == "merge_collect":
             # Re-render the queue screen instead of posting yet another copy
             # of the same merge status into the chat.
-            await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
+            await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html")
             return
         if st.pending in {"archive_collect", "rename_choice"}:
             await self.answer(event, "Send a file or link, or press Cancel.")
@@ -1674,7 +1819,62 @@ class MediaToolsBot:
             # current UI no longer shows an Add More Files button; users simply
             # send another file/URL while the merge session is active.
             st.pending = "merge_collect"
-            await self.safe_edit(event, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
+            await self.safe_edit(event, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html")
+            return
+        if data == "merge:order":
+            await self.show_merge_order(event.chat_id, uid, source=event); return
+        if data == "merge:clear":
+            st.merge_inputs.clear()
+            await self.show_merge_order(event.chat_id, uid, source=event); return
+        if data.startswith("merge:up:") or data.startswith("merge:down:"):
+            delta = -1 if data.startswith("merge:up:") else 1
+            try:
+                index = int(data.rsplit(":", 1)[1])
+            except ValueError:
+                index = -1
+            moved = self._move_merge_item(st, index, delta)
+            await self.answer(event, "Moved." if moved else "Already at the end.")
+            await self.show_merge_order(event.chat_id, uid, source=event)
+            return
+        if data.startswith("merge:pick:"):
+            try:
+                index = int(data.rsplit(":", 1)[1])
+            except ValueError:
+                index = -1
+            if not (0 <= index < len(st.merge_inputs)):
+                await self.answer(event, "That track is no longer in the list.", alert=True)
+                await self.show_merge_order(event.chat_id, uid, source=event)
+                return
+            st.merge_selected = index
+            name = esc(Path(st.merge_inputs[index]).name[:50])
+            await self.render_card(
+                event.chat_id, uid,
+                f"\U0001F501 <b>Track {index + 1}: {name}</b>\n\nWhat would you like to do?",
+                buttons=merge_pick_menu(index, len(st.merge_inputs)),
+            )
+            return
+        if data.startswith("merge:shift:"):
+            delta = int(data.rsplit(":", 1)[1])
+            index = getattr(st, "merge_selected", 0)
+            moved = self._move_merge_item(st, index, delta)
+            await self.answer(event, "Moved." if moved else "Already at the edge.")
+            await self.show_merge_order(event.chat_id, uid, source=event)
+            return
+        if data == "merge:top" or data == "merge:bottom":
+            index = getattr(st, "merge_selected", 0)
+            if 0 <= index < len(st.merge_inputs):
+                item = st.merge_inputs.pop(index)
+                st.merge_inputs.insert(0 if data == "merge:top" else len(st.merge_inputs), item)
+            await self.show_merge_order(event.chat_id, uid, source=event)
+            return
+        if data == "merge:drop":
+            index = getattr(st, "merge_selected", 0)
+            if 0 <= index < len(st.merge_inputs):
+                removed = st.merge_inputs.pop(index)
+                Path(removed).unlink(missing_ok=True)
+                await self.answer(event, "Removed from the merge.")
+            st.merge_selected = 0
+            await self.show_merge_order(event.chat_id, uid, source=event)
             return
         if data == "merge:finish":
             await self.finish_merge(event.chat_id, uid); return
@@ -1690,6 +1890,7 @@ class MediaToolsBot:
             rows += [[Button.inline("✅ Apply", b"streamapply"), Button.inline("Cancel", b"cancel")]]
             await self.safe_edit(event, "Custom Streams: select streams to remove, then Apply.", buttons=rows); return
         if data == "streamapply":
+            await self.await_input(event.chat_id, uid)
             target = self.source_media(st)
             if not target: return
             keep = [s.get("index") for s in st.streams if s.get("index") not in st.custom_remove]
@@ -1760,7 +1961,7 @@ class MediaToolsBot:
             st.queue.drop_finished()
             st.view = "menu"
             await self.stop_timeout(uid)
-            await self.show_file_menu(event.chat_id, uid, st.path, source=event, plain=True)
+            await self.show_file_menu(event.chat_id, uid, st.path, plain=True, fresh=False)
             if len(ready) > 1:
                 await self.answer(event, f"{len(ready)} files ready — Upload sends all of them")
             return
@@ -1780,10 +1981,10 @@ class MediaToolsBot:
                 await self.answer(event, "No finished files to upload yet", alert=True)
                 return
             st.view = "queue"
-            await self.render_ui(
+            await self.render_card(
                 event.chat_id, uid,
                 f"📤 <b>Upload all</b>\n\n<b>Files ready:</b> {len(ready)}\n\nChoose a destination.",
-                buttons=bulk_upload_menu(len(ready)), parse_mode="html", source=event, kind="queue",
+                buttons=bulk_upload_menu(len(ready)),
             )
 
     async def handle_bulk_upload(self, event, uid: int, destination: str) -> None:
@@ -1819,24 +2020,47 @@ class MediaToolsBot:
 
     async def stream_menu(self, chat_id: int, uid: int, mode: str, source=None):
         st = self.state(uid)
+        await self.await_input(chat_id, uid)
         target = self.source_media(st)
         if not target or not target.exists():
-            await self.client.send_message(chat_id, "❌ Send a media file first."); return
-        st.streams = ffprobe.probe(target).get("streams", [])
+            await self.render_card(chat_id, uid, "Send a media file first.", buttons=main_menu()); return
+        # Metadata is normally already known (fetched from the link while it
+        # downloaded, or probed when the file finished), so only pay for a
+        # probe when there is genuinely nothing cached for this file.
+        if not st.streams:
+            st.streams = (await asyncio.to_thread(ffprobe.safe_probe, target)).get("streams", [])
+        if not st.streams:
+            await self.render_card(
+                chat_id, uid,
+                "\U0001F50E No audio or video tracks were found in this file.",
+                buttons=main_menu(),
+            )
+            return
+        action = "extract" if mode == "extract" else "remove"
         rows = [[Button.inline(ffprobe.stream_label(s)[:60], f"stream:{mode}:{s.get('index')}".encode())] for s in st.streams]
         rows += [
+            [Button.inline("🔇 Remove all audio", f"stream:{mode}:drop_audio"), Button.inline("\U0001F50A Keep default audio", f"stream:{mode}:keep_audio")],
             [Button.inline("All Audios", f"stream:{mode}:all_audio"), Button.inline("All Subtitles", f"stream:{mode}:all_sub")],
             [Button.inline("Custom Streams", f"stream:{mode}:custom"), Button.inline("All Streams", f"stream:{mode}:all")],
             [Button.inline("⬅️ Back", b"video:back"), Button.inline("Cancel Process", b"cancel")],
         ]
-        await self.render_ui(chat_id, uid, "Select Your Required Option 👇", buttons=rows, source=source)
+        counts = {
+            "video": sum(1 for s in st.streams if s.get("codec_type") == "video"),
+            "audio": sum(1 for s in st.streams if s.get("codec_type") == "audio"),
+            "subtitle": sum(1 for s in st.streams if s.get("codec_type") == "subtitle"),
+        }
+        summary = f"\U0001F3A0 <b>{counts['video']} video • {counts['audio']} audio • {counts['subtitle']} subtitle</b>"
+        header = (
+            f"{summary}\n\nTap a track to <b>{action}</b> it, or use a quick action below."
+        )
+        await self.render_ui(chat_id, uid, header, buttons=rows, source=source)
 
     async def handle_stream_callback(self, event, uid: int, data: str):
         _, mode, value = data.split(":", 2)
         st = self.state(uid)
         target = self.source_media(st)
         if not target: return
-        streams = st.streams or ffprobe.probe(target).get("streams", [])
+        streams = st.streams or (await asyncio.to_thread(ffprobe.safe_probe, target)).get("streams", [])
         if value.isdigit():
             idx = int(value)
             s = next((x for x in streams if x.get("index") == idx), None)
@@ -1855,6 +2079,27 @@ class MediaToolsBot:
             rows = [[Button.inline(ffprobe.stream_label(s)[:60], f"streamtoggle:{s.get('index')}")] for s in streams]
             rows += [[Button.inline("✅ Apply", b"streamapply"), Button.inline("Cancel", b"cancel")]]
             await self.safe_edit(event, "Custom Streams: select streams to remove, then Apply.", buttons=rows); return
+        if value in {"drop_audio", "keep_audio"}:
+            audio = [s for s in streams if s.get("codec_type") == "audio"]
+            if not audio:
+                await self.answer(event, "This file has no audio tracks.", alert=True)
+                return
+            if value == "drop_audio":
+                if mode != "remove":
+                    await self.answer(event, "Extraction works on one track at a time.", alert=True)
+                    return
+                keep = [s.get("index") for s in streams if s.get("codec_type") != "audio"]
+                if not keep:
+                    await self.answer(event, "This file is audio-only.", alert=True)
+                    return
+                await self.stream_remux(event.chat_id, uid, keep)
+            else:
+                default_audio = [s for s in audio if s.get("disposition", {}).get("default")]
+                chosen = (default_audio or audio)[:1]
+                keep = [s.get("index") for s in streams if s.get("codec_type") != "audio"]
+                keep += [s.get("index") for s in chosen]
+                await self.stream_remux(event.chat_id, uid, keep)
+            return
         if value == "all_audio":
             audio = [s for s in streams if s.get("codec_type") == "audio"]
             default_audio = [s for s in audio if s.get("disposition", {}).get("default")]
@@ -1893,16 +2138,55 @@ class MediaToolsBot:
                 return candidate
         return None
 
-    def video_media(self, st: UserState) -> Path | None:
-        candidates = [st.path, st.source_path, st.root_path]
-        for candidate in candidates:
+    def _has_video(self, path: Path) -> bool:
+        return any(s.get("codec_type") == "video" for s in ffprobe.safe_probe(path).get("streams", []))
+
+    async def video_media(self, st: UserState) -> Path | None:
+        """Pick a video track without blocking the event loop.
+
+        ffprobe used to run inline here. On a large MKV that froze the whole
+        bot for every user, and any probe error collapsed into a None that made
+        the bot claim "send a video first" for a perfectly good file.
+        """
+        for candidate in (st.path, st.source_path, st.root_path):
             if candidate and candidate.exists():
                 try:
-                    if any(s.get("codec_type") == "video" for s in ffprobe.probe(candidate).get("streams", [])):
+                    if await asyncio.to_thread(self._has_video, candidate):
                         return candidate
                 except Exception:
-                    continue
+                    log.debug("video probe failed for %s", candidate, exc_info=True)
         return None
+
+    async def await_input(self, chat_id: int, uid: int, timeout: float = 25.0):
+        """Return the current input, waiting briefly for a pending download.
+
+        The action menu appears before the transfer finishes, so tapping a
+        button straight after sending a file reported "send a media file first"
+        even though the bot was already downloading it. The action now waits for
+        the download it already asked for and only complains if nothing arrived.
+        """
+        st = self.state(uid)
+        if st.path and st.path.exists():
+            return st.path
+        deadline = time.monotonic() + timeout
+        announced = False
+        while time.monotonic() < deadline:
+            pending = st.queue.pending() + st.queue.running()
+            if not pending:
+                return st.path if st.path and st.path.exists() else None
+            if not announced:
+                announced = True
+                names = "\n".join(f"⏳ <b>{esc(p.display_name[:50])}</b>" for p in pending[:3])
+                await self.render_card(
+                    chat_id, uid,
+                    f"⏳ <b>Still downloading…</b>\n\n{names}\n\nWaiting for the transfer to finish…",
+                    buttons=cancel_menu(),
+                )
+            await asyncio.sleep(0.5)
+            st = self.state(uid)
+            if st.path and st.path.exists():
+                return st.path
+        return st.path if st.path and st.path.exists() else None
 
     async def download_merge_input(self, event):
         uid = event.sender_id
@@ -1914,7 +2198,7 @@ class MediaToolsBot:
             return
         name = safe_filename(getattr(file, "name", None) or f"merge_{getattr(message, 'id', 0)}.bin")
         out = unique_path(self.cfg.download_dir / str(uid) / "merge", name)
-        status = await self.new_status_message(event.chat_id, f"Adding merge track\u2026\n{esc(name)}", buttons=cancel_menu(), parse_mode="html")
+        status = await self.new_status_message(event.chat_id, f"Adding merge track\u2026\n{esc(name)}", uid=uid, buttons=cancel_menu(), parse_mode="html")
         reporter = await self.progress_message(status, uid=uid)
         self.begin_job(uid, "Downloading merge track")
         try:
@@ -1929,7 +2213,7 @@ class MediaToolsBot:
             st.merge_inputs.append(out.resolve())
             await self.safe_edit(status, f"Added: {esc(name)}\nTracks queued: {len(st.merge_inputs)}", buttons=None, parse_mode="html")
             st.status_message_id = None; st.status_chat_id = None
-            await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
+            await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html")
             self.touch(uid)
         except asyncio.CancelledError:
             out.unlink(missing_ok=True)
@@ -1940,20 +2224,89 @@ class MediaToolsBot:
         finally:
             self.end_job(uid)
 
+    @staticmethod
+    def _describe_merge_inputs(inputs) -> str:
+        """Render the merge queue as an explicit, numbered order."""
+        if not inputs:
+            return "<i>No files queued yet.</i>"
+        lines = []
+        for idx, raw in enumerate(inputs, 1):
+            path = Path(raw)
+            try:
+                size = format_bytes(path.stat().st_size)
+            except OSError:
+                size = "missing"
+            lines.append(f"{idx}. <b>{esc(path.name[:60])}</b> <i>({size})</i>")
+        return "\n".join(lines)
+
+    def merge_status_text(self, st: UserState) -> str:
+        """The merge screen: the exact order the tracks will be joined in.
+
+        This method was called from five call sites but had no definition, so
+        every merge action raised AttributeError and the feature never worked.
+        """
+        count = len(st.merge_inputs)
+        lines = [
+            "\U0001F500 <b>Merge Tracks</b>",
+            "",
+            f"<b>Files queued:</b> {count}",
+            "",
+            self._describe_merge_inputs(st.merge_inputs),
+            "",
+        ]
+        if count < 2:
+            lines.append("➕ <b>Send another media file or URL</b> to add a track.")
+        else:
+            lines.append("Use <b>Merge order</b> to reorder or remove tracks before merging.")
+        lines.append("Press <b>Finish Merge</b> when the order is right.")
+        return "\n".join(lines)
+
+    def _merge_buttons(self, st: UserState):
+        """Order controls once there is something to order, plain menu before."""
+        count = len(st.merge_inputs)
+        return merge_order_menu(count) if count >= 2 else merge_menu(count)
+
+    async def show_merge_order(self, chat_id, uid, source=None) -> None:
+        """Show the numbered merge order with per-track reorder controls."""
+        st = self.state(uid)
+        count = len(st.merge_inputs)
+        text = (
+            "\U0001F501 <b>Merge Order</b>\n\n"
+            "Tracks are joined top to bottom. Use the arrows to fix the order.\n\n"
+            f"{self._describe_merge_inputs(st.merge_inputs)}"
+        )
+        if count < 2:
+            text += "\n\n<i>Add at least two tracks to merge.</i>"
+            buttons = merge_menu(count)
+        else:
+            buttons = merge_order_menu(count)
+        await self.render_card(chat_id, uid, text, buttons=buttons, parse_mode="html")
+
+    @staticmethod
+    def _move_merge_item(st: UserState, index: int, delta: int) -> bool:
+        """Move the track at ``index`` by ``delta`` positions. True if moved."""
+        items = st.merge_inputs
+        target = index + delta
+        if not (0 <= index < len(items)) or not (0 <= target < len(items)):
+            return False
+        items[index], items[target] = items[target], items[index]
+        return True
+
     async def start_merge(self, chat_id, uid, source=None):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running for you. Press Cancel first.")
+            await self.render_card(chat_id, uid, "⚠️ A process is already running for you. Press Cancel first.", buttons=cancel_menu())
             return
+        await self.await_input(chat_id, uid)
         base = self.source_media(st)
         if not base or not base.exists():
-            await self.client.send_message(chat_id, "❌ Send or download a media file first.")
+            await self.render_card(chat_id, uid, "Send or download a media file first.", buttons=main_menu())
             return
         # Snapshot the first input immediately. Additional media messages are
         # appended by receive_media()/download_merge_input().
         st.pending = "merge_collect"
         st.merge_inputs = [base.resolve()]
-        await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html", source=source)
+        await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html", source=source)
         self.touch(uid)
 
     async def finish_merge(self, chat_id, uid):
@@ -1972,7 +2325,7 @@ class MediaToolsBot:
             if resolved in seen:
                 continue
             try:
-                if ffprobe.probe(p).get("streams"):
+                if (await asyncio.to_thread(ffprobe.safe_probe, p)).get("streams"):
                     inputs.append(p.resolve())
                     seen.add(resolved)
             except Exception:
@@ -1987,7 +2340,7 @@ class MediaToolsBot:
                 chat_id, uid,
                 f"❌ Merge needs at least 2 valid files.\n\n<b>Files queued: {len(inputs)}</b>\n\n"
                 "Send another media file/URL now, then press <b>Finish Merge</b>.",
-                buttons=merge_menu(), parse_mode="html"
+                buttons=self._merge_buttons(st), parse_mode="html"
             )
             self.touch(uid)
             return
@@ -2003,9 +2356,10 @@ class MediaToolsBot:
 
     async def run_direct(self, chat_id, uid, source=None):
         st = self.state(uid)
+        await self.await_input(chat_id, uid)
         path = st.path
         if not path or not path.exists():
-            await self.client.send_message(chat_id, "Send or download a media file first.")
+            await self.render_card(chat_id, uid, "📦 Send or download a media file first.", buttons=main_menu())
             return
         if not self.cfg.public_base_url:
             await self.client.send_message(
@@ -2038,6 +2392,7 @@ class MediaToolsBot:
 
     async def run_info(self, chat_id, uid, source=None):
         st = self.state(uid)
+        await self.await_input(chat_id, uid)
         path = self.source_media(st) or st.path
         if not path or not path.exists():
             await self.render_ui(chat_id, uid, "Send a media file first.", buttons=main_menu())
@@ -2066,13 +2421,14 @@ class MediaToolsBot:
 
     async def run_thumbnail(self, chat_id, uid):
         st = self.state(uid)
-        path = self.video_media(st)
+        await self.await_input(chat_id, uid)
+        path = await self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "Send a video first.")
+            await self.render_card(chat_id, uid, "\U0001F4FC Send a video file first.", buttons=main_menu())
             return
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.jpg")
         self.begin_job(uid, "Extracting thumbnail")
-        status = await self.new_status_message(chat_id, "Extracting thumbnail\u2026", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Extracting thumbnail\u2026", uid=uid, buttons=cancel_menu())
         try:
             async with self.ffmpeg_semaphore:
                 job_token = process_control.set_job(uid)
@@ -2320,7 +2676,7 @@ class MediaToolsBot:
     async def run_gofile(self, chat_id, uid, label="Uploading to GoFile"):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
+            await self.render_card(chat_id, uid, "A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
         files = self._upload_files(st)
         if not files:
@@ -2329,7 +2685,7 @@ class MediaToolsBot:
         self.begin_job(uid, "GoFile upload")
         total_bytes = sum(self._safe_size(p) for p in files)
         status = await self.new_status_message(
-            chat_id,
+            chat_id, uid,
             f"{esc(label)}\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total_bytes)}",
             buttons=cancel_menu(), parse_mode="html",
         )
@@ -2362,14 +2718,14 @@ class MediaToolsBot:
     async def upload_telegram(self, chat_id, uid):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
+            await self.render_card(chat_id, uid, "A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
         files = self._upload_files(st)
         if not files:
             await self.render_ui(chat_id, uid, "No current file.", buttons=main_menu())
             return
         self.begin_job(uid, "Telegram upload")
-        status = await self.new_status_message(chat_id, "Uploading to Telegram using MTProto\u2026", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Uploading to Telegram using MTProto\u2026", uid=uid, buttons=cancel_menu())
         reporter = await self.progress_message(status, uid=uid)
         chunk_dir = self.cfg.work_dir / str(uid) / "telegram_chunks"
         try:
@@ -2453,9 +2809,9 @@ class MediaToolsBot:
         """
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
+            await self.render_card(chat_id, uid, "A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
-        status = await self.new_status_message(chat_id, label + "…", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, label + "…", buttons=cancel_menu(), uid=uid)
         reporter = await self.progress_message(status, uid=uid, operation=label)
         self.begin_job(uid, label)
         guard = self.ffmpeg_semaphore if ffmpeg else self.semaphore
@@ -2509,9 +2865,10 @@ class MediaToolsBot:
 
     async def run_media_job(self, chat_id, uid, operation):
         st = self.state(uid)
-        path = self.video_media(st)
+        await self.await_input(chat_id, uid)
+        path = await self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "This operation requires a video file.")
+            await self.render_card(chat_id, uid, "\U0001F3AC This operation requires a video file.", buttons=video_menu())
             return
         suffix = {"mp4": ".mp4", "toaudio": ".mp3"}.get(operation, ".mkv")
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.{operation}{suffix}")
@@ -2527,33 +2884,40 @@ class MediaToolsBot:
 
     async def run_audio_convert(self, chat_id, uid, codec, ext):
         st = self.state(uid)
-        if not st.path or not st.path.exists():
-            await self.client.send_message(chat_id, "Send audio or video first.")
+        await self.await_input(chat_id, uid)
+        path = self.source_media(st)
+        if not path:
+            await self.render_card(chat_id, uid, "\U0001F3B5 Send an audio or video file first.", buttons=main_menu())
             return
-        out = unique_path(self.cfg.work_dir / str(uid), f"{st.path.stem}.converted{ext}")
-        fn = lambda cb: ffmpeg.audio_convert(st.path, out, codec, on_progress=cb)  # noqa: E731
-        await self.execute(chat_id, uid, "\U0001F3B5 Converting audio", self.make_ffmpeg_job(uid, fn, st.path), upload=True)
+        out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.converted{ext}")
+        fn = lambda cb: ffmpeg.audio_convert(path, out, codec, on_progress=cb)  # noqa: E731
+        await self.execute(chat_id, uid, "\U0001F3B5 Converting audio", self.make_ffmpeg_job(uid, fn, path), upload=True)
 
     async def run_audio_filter(self, chat_id, uid, filt, name):
         st = self.state(uid)
-        if not st.path or not st.path.exists():
-            await self.client.send_message(chat_id, "Send audio or video first.")
+        await self.await_input(chat_id, uid)
+        path = self.source_media(st)
+        if not path:
+            await self.render_card(chat_id, uid, "\U0001F3B5 Send an audio or video file first.", buttons=main_menu())
             return
-        out = unique_path(self.cfg.work_dir / str(uid), f"{st.path.stem}.{safe_filename(name)}.m4a")
-        fn = lambda cb: ffmpeg.audio_filter(st.path, out, filt, on_progress=cb)  # noqa: E731
-        await self.execute(chat_id, uid, f"\U0001F3B5 Applying {esc(name)}", self.make_ffmpeg_job(uid, fn, st.path), upload=True)
+        out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.{safe_filename(name)}.m4a")
+        fn = lambda cb: ffmpeg.audio_filter(path, out, filt, on_progress=cb)  # noqa: E731
+        await self.execute(chat_id, uid, f"\U0001F3B5 Applying {esc(name)}", self.make_ffmpeg_job(uid, fn, path), upload=True)
 
     async def run_trim(self, chat_id, uid, text, audio=False):
         st = self.state(uid)
         st.pending = None
         parts = text.split()
-        if len(parts) not in (1, 2) or not st.path:
-            await self.client.send_message(chat_id, "Use: start end (for example 00:05 00:30)")
+        if len(parts) not in (1, 2):
+            await self.render_card(chat_id, uid, "Use: <code>start end</code> (for example <code>00:05 00:30</code>).", buttons=audio_menu() if audio else video_menu())
             return
         end = parts[1] if len(parts) == 2 else None
-        path = st.path if audio else self.video_media(st)
+        # Validate the input format *before* waiting, but never consult st.path
+        # until the download the user already started has had a chance to land.
+        await self.await_input(chat_id, uid)
+        path = self.source_media(st) if audio else await self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "No suitable media stream was found.")
+            await self.render_card(chat_id, uid, "No suitable media stream was found.", buttons=audio_menu() if audio else video_menu())
             return
         ext = path.suffix or ".mkv"
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.trim{ext}")
@@ -2564,7 +2928,8 @@ class MediaToolsBot:
     async def run_manual_shot(self, chat_id, uid, text):
         st = self.state(uid)
         st.pending = None
-        path = self.video_media(st)
+        await self.await_input(chat_id, uid)
+        path = await self.video_media(st)
         if not path:
             await self.render_ui(chat_id, uid, "Screenshots require a video file.", buttons=video_menu())
             return
@@ -2582,7 +2947,7 @@ class MediaToolsBot:
         outdir.mkdir(parents=True, exist_ok=True)
         shots = []
         self.begin_job(uid, "Capturing frames")
-        status = await self.new_status_message(chat_id, "Capturing frames…", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Capturing frames…", uid=uid, buttons=cancel_menu())
         try:
             for i, timestamp in enumerate(timestamps, 1):
                 if st.cancel_event.is_set():
@@ -2609,21 +2974,22 @@ class MediaToolsBot:
     async def run_split(self, chat_id, uid, text):
         st = self.state(uid)
         st.pending = None
-        path = self.video_media(st)
+        await self.await_input(chat_id, uid)
+        path = await self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "Splitting requires a video file.")
+            await self.render_card(chat_id, uid, "📦 Splitting requires a video file.", buttons=video_menu())
             return
         try:
             seconds = int(str(text).strip())
         except ValueError:
-            await self.client.send_message(chat_id, "Enter a whole number of seconds.")
+            await self.render_card(chat_id, uid, "🔢 Enter a whole number of seconds.", buttons=video_menu())
             return
         if seconds < 1:
-            await self.client.send_message(chat_id, "Segment length must be at least 1 second.")
+            await self.render_card(chat_id, uid, "🔢 Segment length must be at least 1 second.", buttons=video_menu())
             return
         outdir = self.cfg.work_dir / str(uid) / "split"
         self.begin_job(uid, "Splitting video")
-        status = await self.new_status_message(chat_id, "Splitting video…", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Splitting video…", uid=uid, buttons=cancel_menu())
         try:
             job_token = process_control.set_job(uid)
             try:
@@ -2662,9 +3028,10 @@ class MediaToolsBot:
     async def run_sample(self, chat_id, uid, text):
         st = self.state(uid)
         st.pending = None
-        path = self.video_media(st)
+        await self.await_input(chat_id, uid)
+        path = await self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "Generate Sample requires a video file. The current selection is not a video.")
+            await self.render_card(chat_id, uid, "🎬 Generate Sample requires a video file.", buttons=video_menu())
             return
         try:
             seconds = int(str(text).strip() or "30")
@@ -2677,7 +3044,8 @@ class MediaToolsBot:
     async def run_shots(self, chat_id, uid, text):
         st = self.state(uid)
         st.pending = None
-        path = self.video_media(st)
+        await self.await_input(chat_id, uid)
+        path = await self.video_media(st)
         if not path:
             await self.render_ui(chat_id, uid, "Screenshot generation requires a video file.", buttons=video_menu())
             return
@@ -2689,7 +3057,7 @@ class MediaToolsBot:
             await self.render_ui(chat_id, uid, "Screenshot count must be a number from 1 to 20.", buttons=video_menu())
             return
         self.begin_job(uid, "Extracting screenshots")
-        status = await self.new_status_message(chat_id, "Extracting screenshots…", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Extracting screenshots…", uid=uid, buttons=cancel_menu())
         shots: list[Path] = []
         try:
             async with self.ffmpeg_semaphore:
@@ -2877,9 +3245,10 @@ class MediaToolsBot:
         log.info("Transport: MTProto only; HTTP Bot API/Local Bot API is NOT used")
         log.info("FFmpeg=%s FFprobe=%s cryptg=%s", shutil.which("ffmpeg"), shutil.which("ffprobe"), self._cryptg_status())
         log.info(
-            "Limits: jobs=%s ffmpeg=%s parallel_downloads=%s max_download=%sMiB",
+            "Limits: jobs=%s ffmpeg=%s parallel_downloads=%s max_download=%s",
             self.cfg.max_concurrent_jobs, self.cfg.max_ffmpeg_jobs,
-            self.cfg.max_parallel_downloads, self.cfg.max_download_mb,
+            self.cfg.max_parallel_downloads,
+            f"{self.cfg.max_download_mb}MiB" if self.cfg.max_download_mb else "unlimited",
         )
         try:
             await self.client.run_until_disconnected()

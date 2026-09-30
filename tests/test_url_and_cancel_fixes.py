@@ -104,8 +104,15 @@ def test_video_source_falls_back_to_original_when_current_is_subtitle(tmp_path, 
         source_path = video
         root_path = video
 
-    monkeypatch.setattr(main_mod.ffprobe, "probe", lambda p: {"streams": [{"codec_type": "video"}] if p == video else [{"codec_type": "subtitle"}]})
-    assert main_mod.MediaToolsBot.video_media(None, State()) == video
+    monkeypatch.setattr(
+        main_mod.ffprobe,
+        "safe_probe",
+        lambda p: {"streams": [{"codec_type": "video"}] if p == video else [{"codec_type": "subtitle"}]},
+    )
+    # video_media is async and probes off the event loop. Bind the helper to a
+    # real instance, exactly as production does.
+    bot = object.__new__(main_mod.MediaToolsBot)
+    assert asyncio.run(bot.video_media(State())) == video
 
 
 def test_cancel_clears_pending_and_keyboard():

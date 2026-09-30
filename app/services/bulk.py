@@ -38,6 +38,21 @@ class QueueItem:
     path: Path | None = None
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
+    # Container metadata fetched up front for links, so the audio/video track
+    # menus have real entries while the file is still transferring.
+    streams: list = field(default_factory=list)
+    duration: float | None = None
+    probed: bool = False
+    # Background remote-metadata probe, cancelled with the download.
+    probe_task: object | None = None
+
+    @property
+    def audio_count(self) -> int:
+        return sum(1 for s in self.streams if s.get("codec_type") == "audio")
+
+    @property
+    def video_count(self) -> int:
+        return sum(1 for s in self.streams if s.get("codec_type") == "video")
 
     @property
     def key(self) -> str:
@@ -175,6 +190,16 @@ class DownloadQueue:
 
 def _item_line(item: QueueItem) -> str:
     name = esc(item.display_name[:44])
+    # Surface the track count as soon as metadata is known, so the user can
+    # tell a multi-angle video from a single-track file before it finishes.
+    if item.streams and item.status in (DOWNLOADING, QUEUED):
+        bits = []
+        if item.video_count:
+            bits.append(f"{item.video_count}v")
+        if item.audio_count:
+            bits.append(f"{item.audio_count}a")
+        if bits:
+            name += f" <i>[{'+'.join(bits)}]</i>"
     if item.status == DONE:
         size = format_bytes(item.path.stat().st_size) if item.path and item.path.exists() else "ready"
         return f"✅ <b>{name}</b> — {size}"

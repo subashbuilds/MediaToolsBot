@@ -42,12 +42,21 @@ class ProgressReporter:
         return pending if pending else (None, 0)
 
     def _should_emit(self, now: float, total: int, current: int, force: bool) -> bool:
-        if force or not total or current >= total:
+        """Decide whether this update is worth an actual Telegram edit.
+
+        The interval guard must apply even when ``total`` is unknown. The old
+        condition short-circuited to "always emit" for a missing total, so a
+        server streaming without Content-Length edited the message on every
+        single chunk and reliably tripped Telegram's flood-wait. It only
+        appeared to work because the speed figure in the rendered text changed
+        on every chunk, defeating the duplicate-text suppression.
+        """
+        if force:
             return True
-        # The previous guard required a known `total`, so a server that streams
-        # without Content-Length edited the message on *every* chunk and
-        # reliably tripped Telegram's flood-wait. Throttle unknown sizes too.
-        return (now - self.last) >= self.interval
+        if (now - self.last) >= self.interval:
+            return True
+        # Always show the completed state, even inside the throttle window.
+        return bool(total) and current >= total
 
     async def update(self, current: int, total: int, label: str, extra: str = "", force: bool = False) -> None:
         current = max(0, int(current or 0))

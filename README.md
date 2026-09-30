@@ -60,6 +60,10 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 
 Merge means **container/stream muxing**, not timeline concatenation.
 
+Tracks appear as a numbered list showing the exact order they will be joined in.
+Because files finish downloading out of order, you can reorder them before
+merging: move a track up/down, to the top or bottom, or remove it.
+
 Examples:
 
 ```text
@@ -414,9 +418,11 @@ Copy `.env.example` to `.env`.
 | `MAX_CONCURRENT_JOBS` | No | `10` | Global in-flight operation limit |
 | `MAX_CONCURRENT_FFMPEG_JOBS` | No | `2` | Concurrent FFmpeg/7-Zip jobs. Auto-clamped to container RAM, because parallel transcodes are the usual cause of OOM kills |
 | `MAX_PARALLEL_DOWNLOADS` | No | `3` | Files downloaded at the same time per user (max 8) |
-| `MAX_DOWNLOAD_MB` | No | `2048` | Largest single download accepted, in MiB |
+| `MAX_DOWNLOAD_MB` | No | `0` (unlimited) | Largest single download accepted, in MiB. `0` means no cap. Telegram's 2 GiB ceiling is an **upload** limit and is applied only when sending to Telegram; downloads are unrestricted unless you set this. Disk safety comes from `MIN_FREE_BYTES` instead |
 | `MAX_EXTRACT_BYTES` | No | `8589934592` | Largest expanded size accepted when extracting an archive (decompression-bomb guard) |
 | `FFMPEG_TIMEOUT` | No | `14400` | Hard wall-clock limit for one FFmpeg job, in seconds |
+| `MIN_FREE_BYTES` | No | `536870912` | Free disk space required before a download starts. Guards against filling the disk once downloads are uncapped |
+| `FFPROBE_REMOTE_TIMEOUT` | No | `45` | Timeout for reading container metadata straight from a link, in seconds |
 | `PROGRESS_INTERVAL` | No | `3` | Progress update interval in seconds |
 | `SESSION_TIMEOUT` | No | `21600` | Idle session timeout |
 | `BOT_REACTIONS` | No | `on` | Set to `off` to disable the automatic message reaction |

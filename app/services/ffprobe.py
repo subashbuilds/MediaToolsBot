@@ -11,6 +11,9 @@ from pathlib import Path
 # timeout a corrupt or huge container can hang the process forever and take the
 # whole bot down, so every subprocess call is bounded.
 PROBE_TIMEOUT = int(os.environ.get("FFPROBE_TIMEOUT", "120"))
+# Probing a remote URL is a network read against a server the bot does not
+# control, so it gets a tighter budget than a local file probe.
+REMOTE_PROBE_TIMEOUT = int(os.environ.get("FFPROBE_REMOTE_TIMEOUT", "45"))
 PACKET_SCAN_TIMEOUT = int(os.environ.get("FFPROBE_PACKET_TIMEOUT", "600"))
 
 _cache: dict[tuple[str, int, int], tuple[float, dict]] = {}
@@ -52,19 +55,40 @@ def _cache_put(key: tuple[str, int, int], value: dict) -> None:
         _cache[key] = (time.monotonic(), value)
 
 
-def probe(path: Path) -> dict:
-    """Return the ffprobe JSON for ``path`` (raises on failure, as before)."""
+def probe(path: Path, timeout: int = PROBE_TIMEOUT) -> dict:
+    """Return the ffprobe JSON for ``path`` (raises on failure, as before).
+
+    ``path`` may also be an http(s) URL: ffprobe reads the container header
+    over the network, which is how the bot knows a link's audio/video tracks
+    before - or while - the full file is still downloading.
+    """
     key = (str(path), 0, 0)
     cached = _cache_get(key)
     if cached is not None:
         return cached
     cp = _run(
         ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(path)],
-        PROBE_TIMEOUT,
+        timeout,
     )
     data = json.loads(cp.stdout or "{}")
     _cache_put(key, data)
     return data
+
+
+def safe_probe_remote(url: str) -> dict:
+    """Probe a remote URL without raising; returns ``{}`` on any problem.
+
+    Used to populate the stream list for a link the bot is still downloading,
+    so the audio-track menus have something to show immediately.
+    """
+    try:
+        return probe(url, REMOTE_PROBE_TIMEOUT)
+    except FileNotFoundError:
+        return {}
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError, OSError, ValueError):
+        return {}
+    except Exception:
+        return {}
 
 
 def safe_probe(path: Path) -> dict:
