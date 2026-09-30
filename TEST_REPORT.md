@@ -8,7 +8,7 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-147 passed
+154 passed
 
 python -m compileall -q app tests
 PASS
@@ -137,6 +137,20 @@ fails without the fix.
 - The Telegram split threshold is asserted against the documented 2 GiB bot limit.
 - The GoFile path is asserted **not** to chunk.
 - The free-space guard is exercised with a real `shutil.disk_usage` reading.
+
+## Bugs found from the production logs and screenshot
+
+The deployment log and the attached screenshot exposed three separate defects.
+
+| Area | Problem | Effect |
+|---|---|---|
+| Start-up sweep | `await asyncio.to_thread(self._sweep_orphans)` passed an `async def` to a thread helper | Telethon-free but fatal: `RuntimeWarning: coroutine 'MediaToolsBot._sweep_orphans' was never awaited`. The sweep **never ran**, so every restart left the previous run's downloads on disk until the volume filled |
+| Download panel | The non-bulk panel printed only the file name | A healthy transfer looked completely frozen — no bar, no byte counts, no ETA |
+| Panel vs navigation | The background panel repainted whenever `st.view == "queue"`, but nothing ever changed `view` on a button press | Tapping any button opened the submenu and it **immediately snapped back to the main menu** |
+| Merge sizing | No size or duration feedback | Added a running total, estimated output (muxing re-muxes, so ≈ inputs +3%) and longest-track duration after every added file, plus a pre-merge disk-space check |
+
+`tests/test_reported_symptoms.py` reproduces each of these. The submenu regression
+was confirmed to fail against the pre-fix code and pass after it.
 
 ## External integration boundary
 

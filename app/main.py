@@ -103,6 +103,8 @@ class UserState:
     merge_inputs: list[Path] = field(default_factory=list)
     # Index of the track the user is currently reordering in the merge screen.
     merge_selected: int = 0
+    # Duration in seconds per merge input, filled in by a background probe.
+    merge_durations: dict = field(default_factory=dict)
     ui_message_id: int | None = None
     ui_chat_id: int | None = None
     last_activity: float = field(default_factory=time.monotonic)
@@ -996,11 +998,12 @@ class MediaToolsBot:
         if not bulk:
             pending = st.queue.pending() + st.queue.running()
             if pending:
-                lines = ["📥 <b>Downloading…</b>", ""]
-                for entry in pending[:5]:
-                    lines.append(f"⏳ <b>{esc(entry.display_name[:50])}</b>")
-                lines += ["", "<i>You can already pick an action below; the download continues in the background.</i>"]
-                return await self.render_card(chat_id, uid, "\n".join(lines), buttons=main_menu(), fresh=fresh)
+                # Reuse the shared renderer so the running item shows a real
+                # bar, byte counts and ETA. It used to print only the filename,
+                # which made a healthy download look completely frozen.
+                text = render_queue(st.queue, None, bulk=False)
+                text += "\n\n<i>You can already pick an action below; the download continues in the background.</i>"
+                return await self.render_card(chat_id, uid, text, buttons=main_menu(), fresh=fresh)
             return await self.show_file_menu(chat_id, uid, st.path, fresh=fresh)
         active = st.path.name if st.path else None
         text = render_queue(st.queue, active, bulk=True)
@@ -1539,6 +1542,8 @@ class MediaToolsBot:
                     max_bytes=self.download_limit,
                 )
             st.merge_inputs.append(out.resolve())
+            st.probe_tasks.add(asyncio.create_task(self._probe_merge_duration(uid, out.resolve())))
+            st.probe_tasks = {t for t in st.probe_tasks if not t.done()}
             await self.safe_edit(status, f"Added merge URL: {esc(out.name)}\nTracks queued: {len(st.merge_inputs)}", buttons=None, parse_mode="html")
             st.status_message_id = None; st.status_chat_id = None
             await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html")
@@ -1661,6 +1666,12 @@ class MediaToolsBot:
 
     async def callback_router(self, event, uid: int, data: str):
         st = self.state(uid)
+        # Any button press other than the queue's own refresh means the user has
+        # navigated away from the download panel. Without this the background
+        # panel kept repainting over the submenu, so tapping a button appeared
+        # to open the next menu and then snap straight back to the main menu.
+        if not data.startswith("bulk:"):
+            st.view = "menu"
         if data == "cancel":
             await self.cancel(uid, event.chat_id, event); return
         if data == "start:home":
@@ -2211,6 +2222,8 @@ class MediaToolsBot:
             if not result or not out.exists() or out.stat().st_size == 0:
                 raise RuntimeError("Telegram returned no downloaded merge track")
             st.merge_inputs.append(out.resolve())
+            st.probe_tasks.add(asyncio.create_task(self._probe_merge_duration(uid, out.resolve())))
+            st.probe_tasks = {t for t in st.probe_tasks if not t.done()}
             await self.safe_edit(status, f"Added: {esc(name)}\nTracks queued: {len(st.merge_inputs)}", buttons=None, parse_mode="html")
             st.status_message_id = None; st.status_chat_id = None
             await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html")
@@ -2225,10 +2238,11 @@ class MediaToolsBot:
             self.end_job(uid)
 
     @staticmethod
-    def _describe_merge_inputs(inputs) -> str:
+    def _describe_merge_inputs(inputs, durations=None) -> str:
         """Render the merge queue as an explicit, numbered order."""
         if not inputs:
             return "<i>No files queued yet.</i>"
+        durations = durations or {}
         lines = []
         for idx, raw in enumerate(inputs, 1):
             path = Path(raw)
@@ -2236,8 +2250,65 @@ class MediaToolsBot:
                 size = format_bytes(path.stat().st_size)
             except OSError:
                 size = "missing"
-            lines.append(f"{idx}. <b>{esc(path.name[:60])}</b> <i>({size})</i>")
+            line = f"{idx}. <b>{esc(path.name[:60])}</b> <i>({size})</i>"
+            dur = durations.get(str(path))
+            if dur:
+                from .utils.files import format_duration
+                line += f" \u2014 {format_duration(dur)}"
+            lines.append(line)
         return "\n".join(lines)
+
+    def _merge_estimate(self, st: UserState) -> list[str]:
+        """Size and duration estimates shown after every added track.
+
+        Stream muxing copies packets without re-encoding, so the output is
+        very close to the sum of the inputs. Knowing that up front stops a
+        user queueing eight tracks and only discovering afterwards that the
+        result is larger than the disk they have left.
+        """
+        rows: list[str] = []
+        total = 0
+        missing = 0
+        for raw in st.merge_inputs:
+            try:
+                total += Path(raw).stat().st_size
+            except OSError:
+                missing += 1
+        if st.merge_inputs:
+            rows.append(f"\U0001F4E6 <b>Total input:</b> {format_bytes(total)}")
+            # Muxing re-muxes rather than re-encodes; allow a few percent for
+            # container overhead so the estimate is not misleadingly exact.
+            estimate = int(total * 1.03)
+            rows.append(f"\U0001F5C2\uFE0F <b>Estimated output:</b> ~{format_bytes(estimate)}")
+            if missing:
+                rows.append(f"⚠️ <i>{missing} file(s) are missing and will be skipped.</i>")
+        durations = [d for d in st.merge_durations.values() if d]
+        if durations:
+            from .utils.files import format_duration
+            longest = max(durations)
+            total_dur = sum(durations)
+            rows.append(
+                f"⏱ <b>Longest track:</b> {format_duration(longest)}"
+                f"  <i>(all tracks: {format_duration(total_dur)})</i>"
+            )
+        return rows
+
+    async def _probe_merge_duration(self, uid: int, path: Path) -> None:
+        """Cache a merge input's duration in the background."""
+        key = str(path)
+        if key in self.state(uid).merge_durations:
+            return
+        try:
+            data = await asyncio.to_thread(ffprobe.safe_probe, path)
+        except Exception:
+            return
+        raw = (data.get("format") or {}).get("duration")
+        try:
+            value = float(raw) if raw else None
+        except (TypeError, ValueError):
+            value = None
+        if value:
+            self.state(uid).merge_durations[key] = value
 
     def merge_status_text(self, st: UserState) -> str:
         """The merge screen: the exact order the tracks will be joined in.
@@ -2251,9 +2322,12 @@ class MediaToolsBot:
             "",
             f"<b>Files queued:</b> {count}",
             "",
-            self._describe_merge_inputs(st.merge_inputs),
-            "",
+            self._describe_merge_inputs(st.merge_inputs, st.merge_durations),
         ]
+        estimate = self._merge_estimate(st)
+        if estimate:
+            lines += ["", *estimate]
+        lines.append("")
         if count < 2:
             lines.append("➕ <b>Send another media file or URL</b> to add a track.")
         else:
@@ -2273,8 +2347,11 @@ class MediaToolsBot:
         text = (
             "\U0001F501 <b>Merge Order</b>\n\n"
             "Tracks are joined top to bottom. Use the arrows to fix the order.\n\n"
-            f"{self._describe_merge_inputs(st.merge_inputs)}"
+            f"{self._describe_merge_inputs(st.merge_inputs, st.merge_durations)}"
         )
+        estimate = self._merge_estimate(st)
+        if estimate:
+            text += "\n\n" + "\n".join(estimate)
         if count < 2:
             text += "\n\n<i>Add at least two tracks to merge.</i>"
             buttons = merge_menu(count)
@@ -2306,6 +2383,9 @@ class MediaToolsBot:
         # appended by receive_media()/download_merge_input().
         st.pending = "merge_collect"
         st.merge_inputs = [base.resolve()]
+        st.merge_durations.clear()
+        st.probe_tasks.add(asyncio.create_task(self._probe_merge_duration(uid, base.resolve())))
+        st.probe_tasks = {t for t in st.probe_tasks if not t.done()}
         await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=self._merge_buttons(st), parse_mode="html", source=source)
         self.touch(uid)
 
@@ -2347,6 +2427,24 @@ class MediaToolsBot:
         # Freeze the queue before starting FFmpeg so later messages cannot
         # mutate the input list used by the worker.
         snapshot = tuple(inputs)
+        # The merged output is written next to the inputs, so refuse early if
+        # it obviously will not fit. Muxing needs roughly the sum of inputs.
+        needed = sum(self._safe_size(p) for p in snapshot)
+        try:
+            free = shutil.disk_usage(self.cfg.work_dir).free
+        except OSError:
+            free = None
+        if free is not None and needed + (256 * 1024 * 1024) > free:
+            await self.render_ui(
+                chat_id, uid,
+                f"❌ <b>Not enough disk space to merge.</b>\n\n"
+                f"Estimated output: ~{format_bytes(int(needed * 1.03))}\n"
+                f"Free space: {format_bytes(free)}\n\n"
+                "Remove a track from the merge order and try again.",
+                buttons=self._merge_buttons(st), parse_mode="html",
+            )
+            self.touch(uid)
+            return
         st.pending = None
         out = unique_path(self.cfg.work_dir / str(uid), f"{safe_filename(snapshot[0].stem)}.merged.mkv")
         await self.execute(chat_id, uid, "🔀 Merging tracks", lambda: merge_tracks(list(snapshot), out), upload=True)
@@ -3209,13 +3307,40 @@ class MediaToolsBot:
             await self.web_runner.cleanup()
             self.web_runner = None
 
-    async def _sweep_orphans(self) -> None:
+    def _sweep_orphans_sync(self) -> None:
         """Remove leftover files from a previous run at start-up.
 
         A crash or a hard container restart leaves whole download/work
         directories behind. Nothing references them any more, so they are
         deleted once on boot instead of slowly filling the disk.
+
+        This is deliberately *synchronous*: it was declared ``async def`` and
+        then passed to ``asyncio.to_thread``, which accepts the coroutine and
+        throws it away. The sweep therefore never ran, orphan directories
+        accumulated across restarts, and they eventually filled the disk.
         """
+        try:
+            if not self.cfg.download_dir.exists():
+                return
+            known_users = set(self.db.all_users())
+            removed = 0
+            for entry in self.cfg.download_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                if not entry.name.isdigit():
+                    continue
+                if int(entry.name) in known_users and self.state(int(entry.name)).queue.has_work():
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+            if removed:
+                log.info("removed %d orphaned download director%s", removed, "y" if removed == 1 else "ies")
+        except Exception:
+            log.exception("orphan sweep failed")
+
+    async def _sweep_orphans(self) -> None:
+        """Run the start-up orphan sweep off the event loop."""
+        await asyncio.to_thread(self._sweep_orphans_sync)
         try:
             if not self.cfg.download_dir.exists():
                 return
@@ -3238,7 +3363,7 @@ class MediaToolsBot:
     async def run(self):
         await self.start_web_server()
         self.direct_cleanup_task = asyncio.create_task(self._direct_cleanup_loop())
-        await asyncio.to_thread(self._sweep_orphans)
+        await self._sweep_orphans()
         await self.client.start(bot_token=self.cfg.bot_token)
         me = await self.client.get_me()
         log.info("Bot started via Telegram MTProto: @%s id=%s", me.username, me.id)

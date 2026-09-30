@@ -64,6 +64,11 @@ Tracks appear as a numbered list showing the exact order they will be joined in.
 Because files finish downloading out of order, you can reorder them before
 merging: move a track up/down, to the top or bottom, or remove it.
 
+After every file is added the screen also shows the total input size, an
+estimated output size, and the longest track's duration. Muxing re-muxes rather
+than re-encodes, so the output lands close to the sum of the inputs. The bot
+refuses to start if the result clearly will not fit on the disk.
+
 Examples:
 
 ```text
