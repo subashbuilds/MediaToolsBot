@@ -105,7 +105,16 @@ def test_queue_render_escapes_names_and_mentions_parallel_progress():
     assert "<script>" not in text
     assert "&lt;script&gt;" in text
     assert "50.0%" in text
-    assert "background" in text
+    assert "Still downloading" in text
+
+
+def test_queue_render_says_nothing_downloads_until_an_action():
+    """A freshly queued input must not claim a transfer is running."""
+    q = DownloadQueue()
+    q.add(make_item("movie.mkv"))
+    text = render_queue(q, bulk=True)
+    assert "Nothing is downloading yet" in text
+    assert "ready to download" in text
 
 
 def test_bulk_prompt_asks_for_more_files():

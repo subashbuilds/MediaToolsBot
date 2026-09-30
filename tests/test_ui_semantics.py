@@ -161,43 +161,37 @@ def test_action_during_download_waits_instead_of_refusing(tmp_path):
         client = FaithfulClient()
         bot = _new_bot(tmp_path, client)
         st = bot.state(5)
+        from app.services.bulk import QueueItem
 
-        class Slow:
-            payload = b"x" * 2048
+        # Keep the repaint cadence quick so the test stays fast while still
+        # proving that a real percentage is rendered mid-transfer.
+        original_interval = main_mod.PANEL_INTERVAL
+        main_mod.PANEL_INTERVAL = 0.05
+        try:
+            # An input the user has not acted on yet: the action starts it.
+            queued = st.queue.add(QueueItem(kind="url", label="a.mkv", chat_id=5, url="https://x/a.mkv"))
+            st.current_item = queued
 
-            def read(inner):
-                import time as _t
-                _t.sleep(0.02)
-                return b""
+            async def slow_download(u, item):
+                for step in range(1, 5):
+                    item.current, item.total = step * 512, 2048
+                    await asyncio.sleep(0.06)
+                target = tmp_path / "a.mkv"
+                target.write_bytes(b"x" * 2048)
+                return target
 
-        # Simulate an in-flight transfer the user cannot see yet.
-        item = types.SimpleNamespace(
-            path=tmp_path / "a.mkv", display_name="a.mkv",
-            status="downloading", error=None, size=2048, downloaded=0,
-        )
-        st.queue.items = [item]
-        st.queue.running_count = 1
-
-        async def finish():
-            await asyncio.sleep(0.25)
-            st.queue.items = []
-            st.queue.running_count = 0
-            target = tmp_path / "a.mkv"
-            target.write_bytes(b"x" * 2048)
-            st.path = target
-            st.source_path = target
-            st.root_path = target
-
-        task = asyncio.create_task(finish())
-        got = await bot.await_input(1, 5, timeout=3.0)
-        await task
+            bot._download_url_item = slow_download
+            got = await bot.await_input(1, 5, timeout=5.0)
+        finally:
+            main_mod.PANEL_INTERVAL = original_interval
         assert got is not None, "action must wait for the download it started"
         assert got.exists()
         return client
 
     client = asyncio.run(run())
-    # It should have shown a waiting card rather than an error/refusal.
+    # It should have shown real progress rather than an error/refusal.
     assert any("Still downloading" in t for t in client.rendered)
+    assert any("%" in t and "ETA" in t for t in client.rendered), client.rendered
 
 
 def test_action_without_any_file_still_reports_clearly(tmp_path):
@@ -206,9 +200,37 @@ def test_action_without_any_file_still_reports_clearly(tmp_path):
         bot = _new_bot(tmp_path, client)
         st = bot.state(5)
         st.queue.items = []
-        st.queue.running_count = 0
         st.path = None
+        st.current_item = None
         assert await bot.await_input(1, 5, timeout=0.3) is None
+        return client
+
+    asyncio.run(run())
+
+
+def test_queued_input_is_not_downloaded_until_an_action(tmp_path):
+    """Sending a file must not transfer anything by itself."""
+    async def run():
+        client = FaithfulClient()
+        bot = _new_bot(tmp_path, client)
+        st = bot.state(5)
+        from app.services.bulk import QueueItem
+
+        started = []
+
+        async def spy(u, item):
+            started.append(item)
+            return None
+
+        bot._download_telegram_item = spy
+        item = QueueItem(kind="telegram", label="big.mkv", chat_id=5, message_id=3)
+        await bot.enqueue_input(1, 5, item)
+        await asyncio.sleep(0.2)
+        assert started == [], "the arrival of a file must not start a transfer"
+        assert st.path is None
+        card = client.rendered[-1]
+        assert "big.mkv" in card
+        assert "Nothing has been downloaded yet" in card
         return client
 
     asyncio.run(run())
@@ -293,6 +315,7 @@ def test_progress_repaint_edits_in_place(tmp_path):
         st.view = "queue"
         await bot.enqueue_input(1, uid, QueueItem(kind="telegram", label="a.mkv", chat_id=1, message_id=1))
         after_first = len(client.sent)
+        assert after_first >= 1
 
         # A second repaint of the same screen must not add messages.
         await bot._render_queue_panel(uid, 1, force=True)
@@ -385,13 +408,10 @@ def test_full_journey_no_errors_no_duplicates(tmp_path):
         item = QueueItem(kind="telegram", label="movie.mkv", chat_id=1, message_id=42, message=media)
         await bot.enqueue_input(1, uid, item)
 
-        # Let the background worker finish the transfer.
+        # The action the user picks is what starts the transfer.
         st = bot.state(uid)
-        for _ in range(200):
-            if st.path and st.path.exists():
-                break
-            await asyncio.sleep(0.02)
-        assert st.path is not None and st.path.exists(), "download never completed"
+        got = await bot.await_input(1, uid, timeout=10)
+        assert got is not None and got.exists(), "the chosen action must fetch the file"
         st.view = "menu"
         await bot.show_file_menu(1, uid, st.path, fresh=False)
 

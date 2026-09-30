@@ -175,8 +175,8 @@ def make_bot(tmp_path, client, max_parallel=2):
     return bot
 
 
-def test_url_download_runs_in_background_and_sets_active_file(tmp_path):
-    """A real HTTP download driven through the background worker."""
+def test_url_download_starts_on_the_action_and_sets_active_file(tmp_path):
+    """A real HTTP download driven by the action the user picked."""
     from aiohttp import web
 
     from app.services.bulk import QueueItem
@@ -225,10 +225,13 @@ def test_url_download_runs_in_background_and_sets_active_file(tmp_path):
                 await bot.enqueue_input(uid, uid, item)
                 assert client.sent, "a menu must be rendered immediately"
                 st = bot.state(uid)
-                for _ in range(200):
-                    if st.path is not None and not st.queue.has_work():
-                        break
-                    await asyncio.sleep(0.02)
+                # Nothing is transferred just because the link arrived.
+                await asyncio.sleep(0.1)
+                assert st.path is None, "arriving input must not trigger a download"
+                dl_dir = bot.cfg.download_dir / str(uid)
+                assert not dl_dir.exists() or not list(dl_dir.glob("*"))
+                # Picking an action starts it and waits for the result.
+                assert await bot.await_input(uid, uid, timeout=20) is not None
             finally:
                 main_mod.download_url = original
             assert st.path is not None and st.path.exists()
@@ -281,7 +284,7 @@ def test_bulk_users_get_the_queue_keyboard(tmp_path):
         text = client.sent[-1][1]
         assert "Bulk Mode" in text
         assert "40.0%" in text
-        assert "background" in text
+        assert "Still downloading" in text
         assert "Queued:" in text and "Downloading:" in text
 
     asyncio.run(run())
@@ -306,15 +309,14 @@ def test_queue_worker_is_cancelled_by_cancel_downloads(tmp_path):
     asyncio.run(run())
 
 
-def test_media_menu_shown_even_before_download_completes(tmp_path):
-    """The user's core request: menu immediately + background transfer."""
+def test_menu_appears_before_anything_is_downloaded(tmp_path):
+    """The user's core request: the menu appears first, the transfer on demand."""
     client = FakeClient([FakeMessage(1, "a.mkv", b"z" * 2048)])
     bot = make_bot(tmp_path, client)
     uid = 1
 
     async def run():
-        st = bot.state(uid)
-        # Simulate what receive_media does, but keep the transfer pending.
+        # Simulate what receive_media does.
         class Msg:
             id = 1
             photo = video = audio = voice = video_note = None
@@ -332,12 +334,21 @@ def test_media_menu_shown_even_before_download_completes(tmp_path):
 
         bot._download_telegram_item = slow_download
         await bot.enqueue_input(uid, uid, item)
-        await asyncio.wait_for(started.wait(), timeout=2)
-        # Transfer has begun but not finished: the menu is already on screen.
+        # The action menu is on screen immediately...
         assert client.sent
-        assert "Downloading" in client.sent[0][1] or "Bulk" in client.sent[0][1]
-        finish.set()
+        assert "a.mkv" in client.sent[0][1]
+        # ...and no transfer has been started for it.
+        await asyncio.sleep(0.1)
+        assert not started.is_set(), "sending a file must not start a download"
+
+        # Choosing an action starts the transfer and shows progress.
+        wait = asyncio.create_task(bot.await_input(uid, uid, timeout=10))
+        await asyncio.wait_for(started.wait(), timeout=2)
         await asyncio.sleep(0.05)
+        assert any("Still downloading" in t for t in client.rendered), client.rendered
+        finish.set()
+        assert await wait is None  # the fake download produces no file
+        assert any("failed" in t.lower() for t in client.rendered), client.rendered
 
     asyncio.run(run())
 

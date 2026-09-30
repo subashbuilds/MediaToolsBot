@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -47,6 +49,36 @@ URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}]+", re.I)
 PHOTO_SUFFIX = ".jpg"
 REACTION_INTERVAL = 8.0
 PANEL_INTERVAL = 2.0
+
+# Telegram cannot probe a document remotely, so reading the track list of an
+# uploaded file means fetching the first few MiB of it: that prefix carries the
+# container header ffprobe needs. Without it a 40 GiB upload would have to be
+# downloaded in full just to show its audio tracks.
+HEAD_PROBE_BYTES = int(os.environ.get("PROBE_HEAD_BYTES", 8 * 1024 * 1024))
+HEAD_PROBE_CHUNK = 256 * 1024
+# Upper bound for an action that triggered a transfer and is waiting for it.
+DOWNLOAD_WAIT = 4 * 60 * 60
+
+
+def _invoke_job(func, reporter):
+    """Call a blocking job, passing the reporter only if it accepts one.
+
+    ``execute`` runs the callable through ``asyncio.to_thread``. Some job
+    callables want the progress reporter and some take no arguments at all;
+    blindly calling ``func(reporter)`` made every zero-argument job fail with
+    "takes 0 positional arguments but 1 was given", which is how "Removing
+    stream failed" reached the user.
+    """
+    try:
+        parameters = inspect.signature(func).parameters.values()
+    except (TypeError, ValueError):
+        return func(reporter)
+    for parameter in parameters:
+        if parameter.kind is parameter.VAR_POSITIONAL:
+            return func(reporter)
+        if parameter.kind in (parameter.POSITIONAL_ONLY, parameter.POSITIONAL_OR_KEYWORD):
+            return func(reporter)
+    return func()
 
 
 def extract_url(text: str) -> str | None:
@@ -134,6 +166,12 @@ class UserState:
     panel_task: asyncio.Task | None = None
     queue_cancel: asyncio.Event = field(default_factory=asyncio.Event)
     view: str = "start"
+    # The queued item the on-screen menu describes, plus the raw container
+    # metadata read from a link header or a short file prefix. Together they
+    # let Media Information and the track menus work before anything is
+    # transferred.
+    current_item: object | None = None
+    probe_data: dict | None = None
     last_reaction: float = 0.0
     # The single interactive "card" message: always the newest bot message.
     card_message_id: int | None = None
@@ -944,6 +982,8 @@ class MediaToolsBot:
         st = self.state(uid)
         st.queue_cancel.set()
         st.queue.clear()
+        st.current_item = None
+        st.probe_data = None
         for task in list(st.download_tasks):
             task.cancel()
         st.download_tasks.clear()
@@ -980,11 +1020,15 @@ class MediaToolsBot:
             st.panel_task = None
 
     async def _render_queue_panel(self, uid: int, chat_id: int, source=None, force: bool = False, fresh: bool = False):
-        """Repaint the download screen.
+        """Repaint the screen that belongs to the current input.
 
-        Bulk users get the queue panel with its own keyboard; everyone else
-        gets the regular action menu with a download hint above it, so the
-        familiar buttons stay in place while the transfer runs.
+        Three states share one card:
+
+        * an input is waiting for the user to pick something - the action menu
+          plus whatever the header probe already knows about the file;
+        * a transfer is running - the real progress bar, with the familiar
+          buttons still in place so the user is never stuck;
+        * the file is here - the normal per-file menu.
 
         ``fresh`` sends a brand new card. That is required for the very first
         panel after a new input: editing the previous card left the menu
@@ -994,30 +1038,88 @@ class MediaToolsBot:
         if not force and st.view != "queue":
             return None
         bulk = self.db.get_bulk_mode(uid)
-        total, done, running, failed = st.queue.summary()
+        total, done, running, _failed = st.queue.summary()
+        if total == 0 and st.path is None:
+            return await self.show_file_menu(chat_id, uid, None, source=source)
         if not bulk:
-            pending = st.queue.pending() + st.queue.running()
-            if pending:
+            # Only a *running* transfer means there is progress to show. A
+            # queued item is still waiting for the user to pick an action, and
+            # painting a download bar for it would be a lie.
+            inflight = st.queue.running()
+            if inflight:
                 # Reuse the shared renderer so the running item shows a real
                 # bar, byte counts and ETA. It used to print only the filename,
                 # which made a healthy download look completely frozen.
                 text = render_queue(st.queue, None, bulk=False)
-                text += "\n\n<i>You can already pick an action below; the download continues in the background.</i>"
+                text += (
+                    "\n\n⏳ <i>Still downloading — the action you picked runs as soon as "
+                    "the transfer finishes.</i>"
+                )
                 return await self.render_card(chat_id, uid, text, buttons=main_menu(), fresh=fresh)
-            return await self.show_file_menu(chat_id, uid, st.path, fresh=fresh)
+            if st.path is not None:
+                return await self.show_file_menu(chat_id, uid, st.path, fresh=fresh)
+            return await self.render_card(
+                chat_id, uid, self._pending_card_text(uid), buttons=main_menu(), fresh=fresh,
+            )
         active = st.path.name if st.path else None
         text = render_queue(st.queue, active, bulk=True)
         return await self.render_card(chat_id, uid, text, buttons=bulk_menu(done, running), fresh=fresh or bool(force and not st.card_message_id))
 
-    async def enqueue_input(self, chat_id: int, uid: int, item: QueueItem, source=None) -> QueueItem:
-        """Accept a new input and start downloading it in the background.
+    def _pending_card_text(self, uid: int) -> str:
+        """The card for an input that has not been downloaded yet."""
+        st = self.state(uid)
+        item = st.current_item
+        name = esc(item.display_name[:70]) if item is not None else "media"
+        size = 0
+        if item is not None:
+            size = int(item.expected_size or item.total or 0)
+        lines = ["🕒 <b>Ready</b>", "", f"📁 <b>{name}</b>" + (f" — {format_bytes(size)}" if size else "")]
+        streams = st.streams or (item.streams if item is not None else None) or []
+        if streams:
+            counts = [
+                f"{sum(1 for s in streams if s.get('codec_type') == t)} {label}"
+                for t, label in (("video", "video"), ("audio", "audio"), ("subtitle", "subtitle"))
+            ]
+            counts = [c for c in counts if not c.startswith("0 ")]
+            if counts:
+                lines.append("🎞 " + " • ".join(counts) + "  <i>(read from the file header)</i>")
+        lines += [
+            "",
+            "⬇️ <i>Nothing has been downloaded yet. The file is fetched only when you "
+            "pick an action, and the progress is shown here.</i>",
+            "",
+            "Please select your preferred action below 👇",
+        ]
+        return "\n".join(lines)
 
-        The action menu is rendered immediately so the user never waits for a
-        transfer just to see what they can do next.
+    def _start_worker(self, uid: int) -> None:
+        """Begin transferring the queued inputs, with live progress."""
+        st = self.state(uid)
+        st.queue.paused = False
+        if not st.worker_task or st.worker_task.done():
+            st.worker_task = asyncio.create_task(self._queue_worker(uid))
+        if self.db.get_bulk_mode(uid):
+            # Bulk users watch the queue itself, so it needs its own ticker.
+            self._ensure_panel(uid)
+
+    async def enqueue_input(self, chat_id: int, uid: int, item: QueueItem, source=None) -> QueueItem:
+        """Accept a new input and show the action menu - without downloading it.
+
+        The transfer used to start here, so a link or a large upload was
+        fetched whether or not the user ever wanted it. Now the file is only
+        transferred once an action is chosen, and ``await_input`` performs the
+        download with progress. Container metadata is still read up front (a
+        header request for links, a short prefix for Telegram files) so Media
+        Information and the track menus do not need the whole media.
         """
         st = self.state(uid)
         st.queue.add(item)
-        st.view = "queue"
+        st.current_item = item
+        st.path = st.source_path = st.root_path = None
+        st.outputs.clear()
+        st.streams.clear()
+        st.probe_data = None
+        st.view = "menu"
         st.queue_cancel.clear()
         st.card_message_id = None
         st.card_chat_id = None
@@ -1028,9 +1130,7 @@ class MediaToolsBot:
         st.menu_message_id = None
         st.menu_chat_id = None
         await self._render_queue_panel(uid, chat_id, source=source, force=True, fresh=True)
-        self._ensure_panel(uid)
-        if not st.worker_task or st.worker_task.done():
-            st.worker_task = asyncio.create_task(self._queue_worker(uid))
+        self._ensure_metadata(uid, item)
         return item
 
     async def _queue_worker(self, uid: int) -> None:
@@ -1100,34 +1200,106 @@ class MediaToolsBot:
         st.outputs = [path]
         st.streams = []
 
-    async def _probe_item_metadata(self, uid: int, item: QueueItem) -> None:
-        """Populate ``item.streams`` from a remote URL, off the event loop.
+    def _ensure_metadata(self, uid: int, item: QueueItem) -> None:
+        """Kick off the header probe for a freshly queued input."""
+        st = self.state(uid)
+        task = asyncio.create_task(self._probe_item_metadata(uid, item))
+        item.probe_task = task
+        st.probe_tasks.add(task)
+        task.add_done_callback(st.probe_tasks.discard)
 
-        Best effort: any failure leaves the item unprobed and the menus simply
-        fall back to probing the downloaded file later.
+    async def _wait_for_metadata(self, uid: int, timeout: float = 90.0) -> None:
+        """Let the background header probe finish before giving up on it."""
+        st = self.state(uid)
+        tasks = [t for t in st.probe_tasks if not t.done()]
+        if not tasks:
+            return
+        with contextlib.suppress(Exception):
+            await asyncio.wait(tasks, timeout=timeout)
+
+    async def _probe_item_metadata(self, uid: int, item: QueueItem) -> None:
+        """Fill in ``item.streams`` from a header read, not the whole file.
+
+        For a link ffprobe reads the container header over HTTP. For a Telegram
+        document only a short prefix is fetched, which is all a track list or a
+        Media Information page needs. Best effort: any failure leaves the item
+        unprobed and the menus fall back to probing the downloaded file later.
         """
-        if not item.url or item.probed:
+        if item.probed:
             return
         item.probed = True
         try:
-            data = await asyncio.to_thread(ffprobe.safe_probe_remote, item.url)
+            if item.url:
+                data = await asyncio.to_thread(ffprobe.safe_probe_remote, item.url)
+            else:
+                data = await self._probe_head(uid, item)
         except Exception:
-            log.debug("remote probe failed for %s", item.url, exc_info=True)
+            log.debug("metadata probe failed for %s", item.display_name, exc_info=True)
             return
+        if not data:
+            return
+        item.probe_data = data
+        fmt = data.get("format") or {}
         streams = data.get("streams") or []
-        if not streams:
-            return
-        item.streams = streams
-        duration = (data.get("format") or {}).get("duration")
+        if streams:
+            item.streams = streams
+        duration = fmt.get("duration")
         try:
             item.duration = float(duration) if duration else None
         except (TypeError, ValueError):
             item.duration = None
-        # If this item is already the active one, refresh the live menu so the
-        # user can pick an audio track straight away.
+        try:
+            declared = int(fmt.get("size") or 0)
+        except (TypeError, ValueError):
+            declared = 0
+        if declared and not item.expected_size:
+            item.expected_size = declared
+        # If this item is the one on screen, refresh the menu so the user can
+        # pick an audio track - and read the file size - straight away.
         st = self.state(uid)
-        if st.path is None or not st.busy:
+        if st.current_item is not item or st.busy:
+            return
+        st.probe_data = data
+        if not st.path:
             st.streams = streams
+        with contextlib.suppress(Exception):
+            if st.view == "menu" and st.card_message_id:
+                await self._render_queue_panel(uid, st.ui_chat_id or st.card_chat_id or uid, force=True)
+
+    async def _probe_head(self, uid: int, item: QueueItem) -> dict:
+        """Probe only the first few MiB of a Telegram file, then discard them.
+
+        ``TelegramClient.iter_download`` yields the raw chunks; the prefix is
+        written here and probed as a stand-in container. The whole file is never
+        fetched, and the prefix is removed as soon as it has been read.
+        """
+        message = item.message
+        if message is None or not hasattr(self.client, "iter_download"):
+            return {}
+        suffix = Path(item.display_name).suffix or ".bin"
+        dest = self.cfg.work_dir / str(uid) / "probe"
+        dest.mkdir(parents=True, exist_ok=True)
+        out = dest / f"head_{item.item_id}{suffix}"
+        chunks = max(1, HEAD_PROBE_BYTES // HEAD_PROBE_CHUNK)
+        try:
+            written = 0
+            with open(out, "wb") as fh:
+                # ``limit`` bounds the iterator, so it finishes on its own.
+                async for chunk in self.client.iter_download(
+                    message, request_size=HEAD_PROBE_CHUNK, limit=chunks,
+                ):
+                    fh.write(chunk)
+                    written += len(chunk)
+            if not written or not out.exists():
+                return {}
+            return await asyncio.to_thread(ffprobe.safe_probe, out)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("head probe failed for %s", item.display_name, exc_info=True)
+            return {}
+        finally:
+            out.unlink(missing_ok=True)
 
     async def _probe_downloaded_metadata(self, uid: int, item: QueueItem) -> None:
         """Probe a finished local file so the track menus are pre-populated."""
@@ -1149,14 +1321,11 @@ class MediaToolsBot:
         st = self.state(uid)
         if not st.busy and st.path is not None and st.path == path:
             st.streams = streams
+            st.probe_data = data
 
     async def _download_url_item(self, uid: int, item: QueueItem) -> Path:
         st = self.state(uid)
         dest = self.cfg.download_dir / str(uid)
-        # Read the container header over HTTP in parallel with the transfer so
-        # the audio/video track lists are usable straight away.
-        probe_task = asyncio.create_task(self._probe_item_metadata(uid, item))
-        item.probe_task = probe_task
 
         async def cb(current: int, total: int) -> None:
             if st.queue_cancel.is_set():
@@ -1197,6 +1366,14 @@ class MediaToolsBot:
     async def show_file_menu(self, chat_id: int, uid: int, path: Path | None, source=None, plain: bool = False, fresh: bool = True):
         st = self.state(uid)
         if path is None:
+            if st.current_item is not None or st.queue.has_work():
+                # An input is waiting for the user to choose something; it has
+                # not been downloaded, so the menu describes it instead of
+                # asking for a file that is already there.
+                return await self.render_card(
+                    chat_id, uid, self._pending_card_text(uid),
+                    buttons=main_menu(), fresh=fresh, parse_mode="html",
+                )
             st.path = st.source_path = st.root_path = None
             st.outputs.clear()
             st.streams.clear()
@@ -1962,7 +2139,9 @@ class MediaToolsBot:
         if action == "done":
             # Leave bulk collection: the files gathered so far become the
             # working set, so Upload sends all of them and the action menu
-            # operates on the most recent one.
+            # operates on the most recent one. This is where the collection
+            # actually starts transferring - nothing was fetched on arrival.
+            await self._await_queue_drained(event.chat_id, uid)
             ready = st.queue.ready_paths()
             if ready:
                 st.outputs = ready
@@ -1987,6 +2166,7 @@ class MediaToolsBot:
             await self.show_file_menu(event.chat_id, uid, None, source=event)
             return
         if action == "upload":
+            await self._await_queue_drained(event.chat_id, uid)
             ready = st.queue.ready_paths()
             if not ready:
                 await self.answer(event, "No finished files to upload yet", alert=True)
@@ -2031,21 +2211,11 @@ class MediaToolsBot:
 
     async def stream_menu(self, chat_id: int, uid: int, mode: str, source=None):
         st = self.state(uid)
-        await self.await_input(chat_id, uid)
-        target = self.source_media(st)
-        if not target or not target.exists():
-            await self.render_card(chat_id, uid, "Send a media file first.", buttons=main_menu()); return
-        # Metadata is normally already known (fetched from the link while it
-        # downloaded, or probed when the file finished), so only pay for a
-        # probe when there is genuinely nothing cached for this file.
+        # The track list comes from the container header, so the file itself is
+        # not needed to show this menu - only to run the chosen operation.
+        await self._streams_for_menu(chat_id, uid)
         if not st.streams:
-            st.streams = (await asyncio.to_thread(ffprobe.safe_probe, target)).get("streams", [])
-        if not st.streams:
-            await self.render_card(
-                chat_id, uid,
-                "\U0001F50E No audio or video tracks were found in this file.",
-                buttons=main_menu(),
-            )
+            # The helper already explained why there is nothing to show.
             return
         action = "extract" if mode == "extract" else "remove"
         rows = [[Button.inline(ffprobe.stream_label(s)[:60], f"stream:{mode}:{s.get('index')}".encode())] for s in st.streams]
@@ -2069,8 +2239,13 @@ class MediaToolsBot:
     async def handle_stream_callback(self, event, uid: int, data: str):
         _, mode, value = data.split(":", 2)
         st = self.state(uid)
+        # Removing or extracting a stream rewrites the file, so this is the
+        # point where the queued media is actually downloaded - with progress.
+        await self.await_input(event.chat_id, uid)
         target = self.source_media(st)
-        if not target: return
+        if not target:
+            await self.answer(event, "That file is not available any more.", alert=True)
+            return
         streams = st.streams or (await asyncio.to_thread(ffprobe.safe_probe, target)).get("streams", [])
         if value.isdigit():
             idx = int(value)
@@ -2136,10 +2311,51 @@ class MediaToolsBot:
     def _is_nondefault(s: dict) -> bool:
         return not bool(s.get("disposition", {}).get("default"))
 
+    async def _streams_for_menu(self, chat_id: int, uid: int) -> list[dict]:
+        """Return the current input's track list, downloading only if forced to.
+
+        Metadata normally comes from the header read that happened when the
+        input arrived, so opening Stream Remover/Extractor never transfers the
+        media. The full file is only fetched when no header could be read, and
+        even then the transfer runs with the usual progress.
+        """
+        st = self.state(uid)
+        if st.streams:
+            return st.streams
+        if st.probe_data is None and not st.busy:
+            await self._wait_for_metadata(uid)
+        st = self.state(uid)
+        if st.probe_data:
+            streams = st.probe_data.get("streams") or []
+            if streams:
+                st.streams = streams
+                return streams
+        target = self.source_media(st)
+        if not target or not target.exists():
+            target = await self.await_input(chat_id, uid) or target
+        if not target or not target.exists():
+            await self.render_card(chat_id, uid, "Send a media file first.", buttons=main_menu())
+            return []
+        data = await asyncio.to_thread(ffprobe.safe_probe, target)
+        if data:
+            st.probe_data = data
+        streams = (data or {}).get("streams") or []
+        st.streams = streams
+        if not streams:
+            await self.render_card(
+                chat_id, uid,
+                "\U0001F50E No audio or video tracks were found in this file.",
+                buttons=main_menu(),
+            )
+        return streams
+
     async def stream_remux(self, chat_id, uid, keep):
         st = self.state(uid)
+        if not keep:
+            return
+        await self.await_input(chat_id, uid)
         target = self.source_media(st)
-        if not target or not keep: return
+        if not target: return
         out = unique_path(self.cfg.work_dir / str(uid), f"{target.stem}.remux.mkv")
         await self.execute(chat_id, uid, "🧹 Removing streams", lambda: ffmpeg.remux(target, out, keep), upload=True, set_source=True)
 
@@ -2168,36 +2384,88 @@ class MediaToolsBot:
                     log.debug("video probe failed for %s", candidate, exc_info=True)
         return None
 
-    async def await_input(self, chat_id: int, uid: int, timeout: float = 25.0):
-        """Return the current input, waiting briefly for a pending download.
+    async def await_input(self, chat_id: int, uid: int, timeout: float = DOWNLOAD_WAIT):
+        """Return the current input, starting the transfer when it is missing.
 
-        The action menu appears before the transfer finishes, so tapping a
-        button straight after sending a file reported "send a media file first"
-        even though the bot was already downloading it. The action now waits for
-        the download it already asked for and only complains if nothing arrived.
+        The bot no longer downloads a file just because it arrived, so this is
+        where an action gets the media it needs: the queued transfer starts
+        here, real progress is rendered while it runs, and the finished file is
+        returned. That way the first tap works instead of reporting "send a
+        media file first", and nothing is downloaded for an action the user
+        never chose.
         """
         st = self.state(uid)
         if st.path and st.path.exists():
             return st.path
+        if not st.queue.has_work():
+            return None
+        self._start_worker(uid)
+        # Yield once so the worker has claimed an item before the first repaint;
+        # otherwise a fast transfer finishes without the user ever seeing it.
+        await asyncio.sleep(0)
         deadline = time.monotonic() + timeout
-        announced = False
-        while time.monotonic() < deadline:
-            pending = st.queue.pending() + st.queue.running()
-            if not pending:
-                return st.path if st.path and st.path.exists() else None
-            if not announced:
-                announced = True
-                names = "\n".join(f"⏳ <b>{esc(p.display_name[:50])}</b>" for p in pending[:3])
-                await self.render_card(
-                    chat_id, uid,
-                    f"⏳ <b>Still downloading…</b>\n\n{names}\n\nWaiting for the transfer to finish…",
-                    buttons=cancel_menu(),
-                )
-            await asyncio.sleep(0.5)
+        while True:
             st = self.state(uid)
             if st.path and st.path.exists():
                 return st.path
-        return st.path if st.path and st.path.exists() else None
+            if st.cancel_event.is_set():
+                return None
+            if not st.queue.has_work():
+                # Every item settled. The file is normally promoted before the
+                # queue reports itself empty, so a missing path means a failure.
+                await self._render_queue_failure(chat_id, uid)
+                return None
+            with contextlib.suppress(Exception):
+                await self._render_queue_panel(uid, chat_id, force=True)
+            if time.monotonic() >= deadline:
+                log.warning("user %s: gave up waiting for the download", uid)
+                with contextlib.suppress(Exception):
+                    await self.render_card(
+                        chat_id, uid,
+                        "⏱️ <b>The download is taking too long.</b>\nIt is still running in the "
+                        "background — press Cancel to stop it, or try again in a moment.",
+                        buttons=cancel_menu(), parse_mode="html",
+                    )
+                return None
+            await asyncio.sleep(PANEL_INTERVAL)
+
+    async def _render_queue_failure(self, chat_id: int, uid: int) -> None:
+        """Explain a failed transfer instead of claiming no file was sent."""
+        st = self.state(uid)
+        failed = st.queue.failed()
+        if not failed:
+            return
+        last = failed[-1]
+        with contextlib.suppress(Exception):
+            await self.render_card(
+                chat_id, uid,
+                f"❌ <b>Download failed</b>\n\n📁 {esc(last.display_name[:60])}\n"
+                f"{esc(last.error or 'unknown error')}",
+                buttons=main_menu(), parse_mode="html",
+            )
+
+    async def _await_queue_drained(self, chat_id: int, uid: int, timeout: float = DOWNLOAD_WAIT) -> None:
+        """Transfer every queued input, with progress, before a bulk action.
+
+        "Done Adding" and "Upload All" need the actual files, so they are the
+        point where a bulk collection finally starts moving.
+        """
+        st = self.state(uid)
+        if not st.queue.has_work():
+            return
+        self._start_worker(uid)
+        await asyncio.sleep(0)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            st = self.state(uid)
+            if not st.queue.has_work() or st.cancel_event.is_set():
+                break
+            with contextlib.suppress(Exception):
+                await self._render_queue_panel(uid, chat_id, force=True)
+            await asyncio.sleep(PANEL_INTERVAL)
+        st = self.state(uid)
+        if st.queue.failed():
+            await self._render_queue_failure(chat_id, uid)
 
     async def download_merge_input(self, event):
         uid = event.sender_id
@@ -2490,21 +2758,52 @@ class MediaToolsBot:
 
     async def run_info(self, chat_id, uid, source=None):
         st = self.state(uid)
-        await self.await_input(chat_id, uid)
-        path = self.source_media(st) or st.path
+        path = self.source_media(st)
         if not path or not path.exists():
+            # Media Information is built from the container header, so a link -
+            # or a Telegram file whose header was already read - is described
+            # without transferring the media at all. Only when no header could
+            # be read does this fall back to downloading the file.
+            if st.probe_data is None:
+                await self._wait_for_metadata(uid)
+            st = self.state(uid)
+            path = self.source_media(st)
+            if not path or not path.exists():
+                if not st.probe_data:
+                    path = await self.await_input(chat_id, uid) or path
+                    if path and not path.exists():
+                        path = None
+        if not path and not st.probe_data:
             await self.render_ui(chat_id, uid, "Send a media file first.", buttons=main_menu())
             return
         status = await self.render_ui(chat_id, uid, "Collecting detailed media information\u2026", buttons=cancel_menu(), source=source)
         self.begin_job(uid, "Reading media information")
         try:
-            data = await asyncio.to_thread(ffprobe.probe, path)
-            packet_sizes = await asyncio.to_thread(ffprobe.stream_packet_sizes, path)
+            if path:
+                data = await asyncio.to_thread(ffprobe.probe, path)
+                packet_sizes = await asyncio.to_thread(ffprobe.stream_packet_sizes, path)
+                name = path.name
+                size_text = format_bytes(path.stat().st_size)
+            else:
+                # Header-only metadata: exact packet payload sizes are only
+                # available by scanning the media itself, which is exactly what
+                # this path avoids, so that one figure is left out.
+                data = st.probe_data or {}
+                packet_sizes = {}
+                item = st.current_item
+                name = item.display_name if item is not None else "media"
+                try:
+                    size = int((data.get("format") or {}).get("size") or 0)
+                except (TypeError, ValueError):
+                    size = 0
+                if not size and item is not None:
+                    size = int(getattr(item, "expected_size", 0) or 0)
+                size_text = format_bytes(size) if size else "unknown (not downloaded)"
             page = await create_info_page(
-                data, path.name, format_bytes(path.stat().st_size),
+                data, name, size_text,
                 self.cfg.telegraph_access_token, packet_sizes=packet_sizes,
             )
-            text = f"\U0001F4CB <b>{esc(path.name)}</b>\n\n\U0001F517 <a href=\"{page}\">Open detailed Media Information</a>"
+            text = f"\U0001F4CB <b>{esc(name)}</b>\n\n\U0001F517 <a href=\"{page}\">Open detailed Media Information</a>"
             await self.safe_edit(status, text, buttons=[[Button.inline("\u2B05\uFE0F Back", b"video:back")]], parse_mode="html", link_preview=False)
             self.state(uid).status_message_id = None
             self.state(uid).status_chat_id = None
@@ -2919,7 +3218,7 @@ class MediaToolsBot:
             async with guard:
                 job_token = process_control.set_job(uid)
                 try:
-                    out = await asyncio.to_thread(func, reporter)
+                    out = await asyncio.to_thread(_invoke_job, func, reporter)
                 finally:
                     process_control.reset_job(job_token)
             if st.cancel_event.is_set():

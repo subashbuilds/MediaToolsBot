@@ -8,7 +8,10 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-154 passed
+163 passed
+
+MEDIABOT_LIVE=1 pytest -q tests/test_live_integrations.py
+3 passed
 
 python -m compileall -q app tests
 PASS
@@ -152,16 +155,69 @@ The deployment log and the attached screenshot exposed three separate defects.
 `tests/test_reported_symptoms.py` reproduces each of these. The submenu regression
 was confirmed to fail against the pre-fix code and pass after it.
 
-## External integration boundary
+## Bugs fixed in the on-demand download pass
 
-The isolated build environment does not contain a Docker daemon and does not have live Telegram/GoFile credentials. Therefore the following cannot honestly be claimed as live-network-tested here:
+The bot used to start downloading the moment a file or link arrived, and Media
+Information could not answer without the whole file.
 
-- Real Telegram authentication with the supplied production bot account
-- Real multi-gigabyte Telegram transfer
-- Real GoFile upload against a live account
-- Live Railway/Render ingress
-- Live Telegraph account creation
+| Area | Problem | Effect |
+|---|---|---|
+| Download on arrival | `enqueue_input()` started the worker immediately | Every link and upload was transferred whether or not the user wanted it, and a failed/pointless download still cost bandwidth and disk |
+| `execute()` arity | The job callable was always called as `func(reporter)` | Every zero-argument job — `remux`, `extract_stream`, `merge_tracks`, the custom-stream removal — died with `TypeError: ...<lambda>() takes 0 positional arguments but 1 was given`, which is the "🧹 Removing stream failed" report |
+| Media Information | Always probed the downloaded file | A large file had to arrive in full before the user could see what it was |
+| Track lists | Only known after the download | Stream Remover/Extractor could not be opened before the transfer completed |
+| Merge / bulk | Merge inputs and the bulk queue relied on the eager download | With the download removed, `Done Adding` and `Upload All` had to start the transfer themselves, with progress |
 
-The release therefore distinguishes **automated local verification** from **live deployment verification** instead of claiming that external services were tested with credentials that were not available to the build environment.
+The fix:
 
-The SSRF guard is covered by tests that assert the block; the two local-HTTP download tests opt in explicitly with `allow_private=True`, which is the same escape hatch the `ALLOW_PRIVATE_DOWNLOADS` environment variable provides in production.
+- `_invoke_job()` inspects the job signature and passes the progress reporter
+  only to callables that accept one, so both arities work at every call site.
+- `enqueue_input()` queues the input and shows the menu; `_start_worker()` and
+  `await_input()` start the transfer when an action asks for it, rendering the
+  real progress bar, and report a failed transfer instead of claiming no file
+  was sent.
+- Metadata is read without the media: FFprobe reads a link's container header
+  over HTTP, and a Telegram document is probed from a short prefix
+  (`PROBE_HEAD_BYTES`, 8 MiB by default) that is deleted immediately. Media
+  Information and the track menus use that data; only operations that really
+  rewrite or send the file download it, and only then fall back to a full
+  download if no header could be read.
+- Bulk mode transfers on `Done Adding` / `Upload All`, with progress.
+
+`tests/test_on_demand_download.py` pins all of it, including a real FFmpeg
+stream removal — the exact call that raised the reported `TypeError`.
+
+## Live verification with the supplied environment
+
+Run with the values from `.env` (names only in this report; no secret is
+printed):
+
+```text
+python -m app
+INFO media-tools: Bot started via Telegram MTProto: @MediaTooolsBot id=8992989518
+INFO media-tools: Transport: MTProto only; HTTP Bot API/Local Bot API is NOT used
+INFO media-tools: FFmpeg=/usr/bin/ffmpeg FFprobe=/usr/bin/ffprobe cryptg=optional-not-installed
+INFO media-tools: Limits: jobs=10 ffmpeg=1 parallel_downloads=3 max_download=unlimited
+```
+
+The bot authenticated over MTProto with the configured `API_ID`/`API_HASH`/
+`BOT_TOKEN`, started the direct-link server, swept the download directory and
+shut down cleanly on `SIGINT`.
+
+`tests/test_live_integrations.py` (opt-in, `MEDIABOT_LIVE=1`) then runs a real
+user journey against a local HTTP origin with real FFmpeg/FFprobe and the real
+services:
+
+1. a link is sent — **nothing is downloaded**;
+2. Media Information is requested — a **real Telegraph page** is created from
+   the container header, still without a download;
+3. Stream Remover is opened — the track list comes from the header;
+4. a track is removed — this is where the transfer starts, progress is shown,
+   real FFmpeg muxes the result, and the file is then uploaded with the
+   configured GoFile token.
+
+Still not verifiable from here: a multi-gigabyte Telegram transfer (needs a real
+user account, not a bot token) and live Railway/Render ingress. The SSRF guard
+is covered by tests that assert the block; the local-HTTP tests opt in
+explicitly with `allow_private=True`, the same escape hatch
+`ALLOW_PRIVATE_DOWNLOADS` provides in production.

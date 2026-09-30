@@ -17,7 +17,8 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 - A link pasted inside a longer message is detected too
 - URL input uses the same processing workflow as Telegram input
 - URL/file uploader can upload the current file to Telegram or GoFile
-- The action menu appears immediately; downloads continue in the background
+- The action menu appears immediately; the transfer starts only when you pick an action
+- Media Information and the track lists are built from the file header, so they work without downloading the media
 - Several files can be queued and downloaded in parallel (see Bulk mode)
 - Download progress with speed and ETA
 - Private/loopback addresses are refused so the bot cannot be used to reach internal services
@@ -278,7 +279,33 @@ When a button is pressed, the same dashboard message is edited rather than sendi
 
 ### Media menu
 
-The action menu appears **as soon as** a file or link arrives — the transfer itself runs in the background, so a slow download never blocks the user from choosing what to do next. Progress is rendered into that same menu, which means the chat does not fill up with one progress message per action.
+The action menu appears **as soon as** a file or link arrives, but nothing is transferred yet. Sending a 40 GiB upload no longer costs a 40 GiB download you may never use: the file is fetched only when you pick an action, and the progress is rendered into that same card while it runs.
+
+```text
+🕒 Ready
+
+📁 movie.mkv — 2.35 GiB
+🎞 1 video • 5 audio • 2 subtitle  (read from the file header)
+
+⬇️ Nothing has been downloaded yet. The file is fetched only when you pick
+   an action, and the progress is shown here.
+
+Please select your preferred action below 👇
+```
+
+What can be answered **without downloading the media**:
+
+| Action | Needs the file? |
+|---|---|
+| Media Information | No — read from the container header |
+| Stream Remover / Extractor track list | No — read from the container header |
+| Everything else (trim, convert, merge, upload, extract, …) | Yes — downloaded on tap, with progress |
+
+For an `http(s)` link the header is read over HTTP by FFprobe. Telegram cannot
+probe a document remotely, so the first few MiB are fetched instead — enough for
+the container header, never the whole file. That prefix is deleted immediately.
+If no header can be read at all, the action falls back to downloading the file
+with the usual progress.
 
 Navigation always edits the message that is already on screen instead of sending a new one. When the tracked message can no longer be edited (deleted, or from before a restart) a fresh one is sent automatically.
 
@@ -301,12 +328,12 @@ Queued: 3   Ready: 1   Downloading: 2
 🗑️ Clear Queue
 ```
 
-- Several files transfer **in parallel** while the user picks an action.
-- **Done Adding** hands the collected files to the normal menu; `Upload` then sends all of them.
+- Several files transfer **in parallel** once an action needs them.
+- **Done Adding** is where the collection transfers; it hands the collected files to the normal menu, and `Upload` then sends all of them.
 - **Upload All** picks a destination for the whole set in one step.
 - The bulk prompt stays up until the user explicitly finishes, so a file is never silently replaced by the next one.
 
-With bulk mode off the regular action menu is used, with a note about how many files are still downloading.
+With bulk mode off the regular action menu is used, with a note about how many files are still transferring.
 
 ### Cancellation
 
@@ -428,6 +455,7 @@ Copy `.env.example` to `.env`.
 | `FFMPEG_TIMEOUT` | No | `14400` | Hard wall-clock limit for one FFmpeg job, in seconds |
 | `MIN_FREE_BYTES` | No | `536870912` | Free disk space required before a download starts. Guards against filling the disk once downloads are uncapped |
 | `FFPROBE_REMOTE_TIMEOUT` | No | `45` | Timeout for reading container metadata straight from a link, in seconds |
+| `PROBE_HEAD_BYTES` | No | `8388608` | How much of a Telegram file is fetched to read its container header when the track list or Media Information is requested. The prefix is deleted right after probing; if it is not enough the action falls back to a full download |
 | `PROGRESS_INTERVAL` | No | `3` | Progress update interval in seconds |
 | `SESSION_TIMEOUT` | No | `21600` | Idle session timeout |
 | `BOT_REACTIONS` | No | `on` | Set to `off` to disable the automatic message reaction |
@@ -532,6 +560,13 @@ Run all tests:
 pytest -q
 ```
 
+The suite that talks to the real services (Telegram credentials, Telegraph and
+GoFile) is opt-in:
+
+```bash
+MEDIABOT_LIVE=1 pytest -q tests/test_live_integrations.py
+```
+
 The test suite covers:
 
 - FFmpeg/FFprobe media processing
@@ -550,7 +585,10 @@ The test suite covers:
 - Timeout cleanup
 - Sudo administration
 - The background download queue (parallelism, pausing, cancellation, promotion)
+- On-demand downloading: nothing transfers until an action asks for it
+- Metadata-only Media Information and track lists (header and short-prefix probe)
 - A scripted end-to-end bulk session against a fake Telegram client
+- Opt-in live checks against Telegram, Telegraph and GoFile (`MEDIABOT_LIVE=1`)
 - Regression tests for every bug fixed in the latest pass (trim bounds, MP4 audio, progress throttling, split naming, timecode validation, config tolerance, SSRF guard)
 
 ---

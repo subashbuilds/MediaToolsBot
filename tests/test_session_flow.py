@@ -43,10 +43,11 @@ class FakeMsg:
 
 
 def drain(bot, uid, rounds=200):
+    """Wait for the queue to go quiet (used after an action starts it)."""
     async def run():
         st = bot.state(uid)
         for _ in range(rounds):
-            if not st.queue.has_work():
+            if not st.queue.has_work() and st.worker_task is None:
                 return
             await asyncio.sleep(0.01)
     return run()
@@ -77,18 +78,22 @@ def test_bulk_session_end_to_end(tmp_path):
 
         st = bot.state(uid)
         assert len(st.queue) == 3, "all three inputs must be accepted immediately"
-        # A queue panel is on screen while the transfers are still pending.
+        # A queue panel is on screen, and nothing has been transferred yet.
         assert any("Bulk Mode" in t for t in client.rendered), client.rendered
-
+        assert any("Nothing is downloading yet" in t for t in client.rendered), client.rendered
         await drain(bot, uid)
-        assert st.queue.summary()[1] == 3, "all three downloads should complete"
-        assert st.path is not None and st.path.exists()
-        # The bot keeps asking for more files until the user says it is done.
-        assert any("Send another file" in t for t in client.rendered), client.rendered
+        assert st.queue.summary()[1] == 0, "a queued input must not download by itself"
+        assert st.path is None
 
-        # "Done Adding" switches to the regular action menu.
+        # "Done Adding" is where the collection actually transfers.
         done = FakeEvent(uid, "bulk:done")
         await bot.callback_router(done, uid, "bulk:done")
+        assert len(st.outputs) == 3, "all three downloads should complete"
+        assert st.path is not None and st.path.exists()
+        # The bulk queue stayed on screen, with the transfer it started.
+        assert any("Bulk Mode" in t and "clip" in t for t in client.rendered), client.rendered
+
+        # ...and it switches to the regular action menu.
         assert st.view == "menu"
         assert st.path is not None
         assert any("select your preferred action" in t.lower() for t in client.rendered)

@@ -39,8 +39,11 @@ class QueueItem:
     started_at: float = field(default_factory=time.monotonic)
     finished_at: float | None = None
     # Container metadata fetched up front for links, so the audio/video track
-    # menus have real entries while the file is still transferring.
+    # menus have real entries before - or instead of - the full transfer.
     streams: list = field(default_factory=list)
+    # The full ffprobe payload behind ``streams``; Media Information is built
+    # from it so the media itself never has to be downloaded for it.
+    probe_data: dict | None = None
     duration: float | None = None
     probed: bool = False
     # Background remote-metadata probe, cancelled with the download.
@@ -89,10 +92,11 @@ class QueueItem:
 
 
 class DownloadQueue:
-    """Per-user queue of pending and completed downloads.
+    """Per-user queue of waiting and completed downloads.
 
-    Downloading happens in the background so the action menu is available the
-    moment a file or link arrives, and several items can transfer in parallel.
+    Nothing is transferred when an input arrives. The queue is filled, the
+    action menu is shown, and the worker only starts once the user picks an
+    action - from then on several items can transfer in parallel.
     """
 
     def __init__(self, max_parallel: int = 3):
@@ -214,7 +218,7 @@ def _item_line(item: QueueItem) -> str:
         else:
             text = f"{bar} {format_bytes(item.current)}"
         return f"⬇️ <b>{name}</b>\n    {text}"
-    return f"⏳ <b>{name}</b> — queued"
+    return f"⏳ <b>{name}</b> — ready to download"
 
 
 def render_queue(queue: DownloadQueue, active_name: str | None = None, bulk: bool = True) -> str:
@@ -232,8 +236,10 @@ def render_queue(queue: DownloadQueue, active_name: str | None = None, bulk: boo
             lines.append(f"<i>… and {total - MAX_VISIBLE_ITEMS} more</i>")
     if active_name:
         lines += ["", f"📁 <b>Active file:</b> {esc(active_name[:70])}"]
-    if queue.has_work():
-        lines += ["", "<i>Downloads continue in the background — you can already pick an action below.</i>"]
+    if running:
+        lines += ["", "<i>Still downloading — your chosen action starts as soon as the transfer finishes.</i>"]
+    elif queue.has_work():
+        lines += ["", "<i>Nothing is downloading yet. The transfer starts when you pick an action below.</i>"]
     elif done:
         lines += ["", "➕ <b>Send another file or URL to add more</b>, or pick an action below 👇"]
     return "\n".join(lines)
@@ -255,7 +261,7 @@ def render_bulk_prompt(queue: DownloadQueue, active: Path | None = None) -> str:
     lines += [
         "",
         "➕ <b>Send another file or link to add more</b> — the menu updates instantly and "
-        "downloads keep running in the background.",
+        "nothing is downloaded until you choose what to do with a file.",
         "",
         "Press <b>Done Adding</b> when you are finished, or choose an action below 👇",
     ]
