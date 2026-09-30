@@ -79,7 +79,9 @@ def test_gofile_completion_does_not_emit_folder_link():
 def test_cancel_deletes_temporary_files_but_direct_links_are_protected():
     source = Path("app/main.py").read_text()
     cancel_block = source[source.index('async def cancel('):source.index('async def start_web_server', source.index('async def cancel('))]
-    assert 'cleanup_user_files(uid)' in cancel_block
+    # An explicit Cancel forces cleanup even for users who enabled "Keep Files":
+    # the user asked for the job to be thrown away.
+    assert 'cleanup_user_files(uid, force=True)' in cancel_block
     assert 'clear_status_message(uid, delete=True)' in cancel_block
     assert 'active_direct_paths' in source
 

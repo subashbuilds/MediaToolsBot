@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import os
 import re
 import shutil
+import subprocess
 import time
 import secrets
 from aiohttp import web
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 from telethon import Button, TelegramClient, events
 from telethon.errors import MessageNotModifiedError
@@ -17,21 +19,70 @@ from telethon.tl.custom.message import Message
 
 from .config import Config
 from .storage.db import DB
-from .ui.keyboards import audio_menu, cancel_menu, main_menu, upload_menu, video_menu, merge_menu, rename_menu, settings_menu, admin_menu
+from .ui.keyboards import (
+    admin_menu, archive_collect_menu, archive_mode_menu, archive_password_menu,
+    audio_menu, bulk_menu, bulk_upload_menu, cancel_menu, main_menu, merge_menu,
+    rename_menu, settings_menu, upload_menu, video_menu,
+)
 from .services import ffmpeg, ffprobe
 from .services.archive import extract_archive, is_archive, archive_requires_password, multipart_info
+from .services.bulk import DownloadQueue, QueueItem, render_bulk_prompt, render_queue
 from .services.downloader import download_url
 from .services.gofile import upload_gofile, create_folder
 from .services.telegraph import create_info_page
 from .services.merge import merge_tracks
-from .utils.files import format_bytes, format_duration, format_bitrate, safe_filename, unique_path
+from .utils.files import error_text, esc, format_bytes, safe_filename, unique_path
 from .utils.progress import ProgressReporter
 from .services.system import system_stats_text
-from .services.telegram_upload import chunk_file, MAX_TELEGRAM_CHUNK
+from .services.telegram_upload import chunk_file
 from telethon import functions, types
 from .services import process_control
 
 log = logging.getLogger("media-tools")
+
+URL_RE = re.compile(r"https?://[^\s<>\"'()\[\]{}]+", re.I)
+PHOTO_SUFFIX = ".jpg"
+REACTION_INTERVAL = 8.0
+PANEL_INTERVAL = 2.0
+
+
+def extract_url(text: str) -> str | None:
+    """Pull the first http(s) URL out of a free-form message.
+
+    Users routinely send "download this https://… please" instead of a bare
+    link; treating that as a media input is far friendlier than a rejection.
+    """
+    match = URL_RE.search(text or "")
+    if not match:
+        return None
+    return match.group(0).rstrip(".,;:!?'\"»")
+
+
+def guess_media_name(message, fallback: str) -> str:
+    """Derive a sensible filename for an incoming Telegram message."""
+    file = getattr(message, "file", None)
+    name = getattr(file, "name", None) if file else None
+    if name:
+        return safe_filename(name)
+    if getattr(message, "photo", None):
+        return f"photo_{getattr(message, 'id', 0)}{PHOTO_SUFFIX}"
+    if getattr(message, "video", None):
+        return f"video_{getattr(message, 'id', 0)}.mp4"
+    if getattr(message, "audio", None):
+        return f"audio_{getattr(message, 'id', 0)}.mp3"
+    if getattr(message, "voice", None):
+        return f"voice_{getattr(message, 'id', 0)}.ogg"
+    if getattr(message, "video_note", None):
+        return f"video_note_{getattr(message, 'id', 0)}.mp4"
+    # A photo/message without a file part still has a usable MIME type.
+    mime = (getattr(file, "mime_type", "") or "") if file else ""
+    ext = {
+        "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+        "video/mp4": ".mp4", "audio/ogg": ".ogg", "audio/mpeg": ".mp3",
+    }.get(mime, "")
+    if ext:
+        return f"media_{getattr(message, 'id', 0)}{ext}"
+    return fallback
 
 
 @dataclass
@@ -68,6 +119,14 @@ class UserState:
     menu_message_id: int | None = None
     menu_chat_id: int | None = None
     output_root: Path | None = None
+    # -- background download pipeline -----------------------------------
+    queue: DownloadQueue = field(default_factory=DownloadQueue)
+    download_tasks: set = field(default_factory=set)
+    worker_task: asyncio.Task | None = None
+    panel_task: asyncio.Task | None = None
+    queue_cancel: asyncio.Event = field(default_factory=asyncio.Event)
+    view: str = "start"
+    last_reaction: float = 0.0
 
     @property
     def busy(self) -> bool:
@@ -81,14 +140,22 @@ class MediaToolsBot:
         self.client = TelegramClient(str(cfg.work_dir / "media_tools_bot"), cfg.api_id, cfg.api_hash)
         self.states: dict[int, UserState] = {}
         self.semaphore = asyncio.Semaphore(cfg.max_concurrent_jobs)
+        # FFmpeg gets its own, much smaller budget: a handful of parallel
+        # 1080p transcodes is enough to OOM-kill a 2 GiB container, and a
+        # killed container takes every in-flight job with it.
+        self.ffmpeg_semaphore = asyncio.Semaphore(cfg.max_ffmpeg_jobs)
         self.client.add_event_handler(self.on_new_message, events.NewMessage)
         self.client.add_event_handler(self.on_callback, events.CallbackQuery)
         self.web_runner: web.AppRunner | None = None
         self.direct_cleanup_task: asyncio.Task | None = None
+        self.sweeper_task: asyncio.Task | None = None
+        self.download_limit = max(1, cfg.max_download_mb) * 1024 * 1024
 
     def state(self, uid: int) -> UserState:
         if uid not in self.states:
-            self.states[uid] = UserState()
+            st = UserState()
+            st.queue.max_parallel = max(1, self.cfg.max_parallel_downloads)
+            self.states[uid] = st
         return self.states[uid]
 
     async def stop_timeout(self, uid: int) -> None:
@@ -98,12 +165,19 @@ class MediaToolsBot:
         st.timeout_task = None
 
     async def react_to_message(self, event) -> None:
-        """React to every incoming private message using a small rotating set.
+        """React to incoming private messages using a small rotating set.
 
         This uses Telegram's real MTProto messages.sendReaction method. The
-        Outgoing message effects are different from reactions on an existing
-        user message, so this uses the real MTProto reaction request.
+        reaction is rate limited per user because it costs one API call per
+        message and quickly earns a flood-wait otherwise.
         """
+        if not self.cfg.reactions_enabled:
+            return
+        st = self.state(int(event.sender_id or 0))
+        now = time.monotonic()
+        if now - st.last_reaction < REACTION_INTERVAL:
+            return
+        st.last_reaction = now
         reactions = ("👍", "🔥", "🎉", "❤️")
         try:
             idx = (int(event.message.id) + int(event.sender_id or 0)) % len(reactions)
@@ -133,9 +207,13 @@ class MediaToolsBot:
         st.menu_chat_id = None
         st.ui_message_id = None
         st.ui_chat_id = None
+        st.view = "start"
 
     def allowed(self, uid: int) -> bool:
         # SUDO_USERS grants elevated controls; it is not a whitelist.
+        # ALLOWED_USERS, when set, is an explicit opt-in whitelist.
+        if self.cfg.allowed_users:
+            return uid in self.cfg.allowed_users or uid in self.cfg.sudo_users
         return True
 
     def is_sudo(self, uid: int) -> bool:
@@ -195,6 +273,7 @@ class MediaToolsBot:
         if st.busy and st.task is not asyncio.current_task():
             st.cancel_event.set()
             st.task.cancel()
+        self.cancel_downloads(uid)
         try:
             await asyncio.sleep(0.2)
         except asyncio.CancelledError:
@@ -205,11 +284,18 @@ class MediaToolsBot:
         st.outputs.clear(); st.streams.clear(); st.merge_inputs.clear(); st.archive_parts.clear(); st.output_root = None; st.pending = None
         st.archive_series = st.archive_password = st.archive_mode = None
         st.pending_upload_destination = None; st.pending_admin_action = None
-        st.menu_message_id = st.menu_chat_id = None
+        st.queue.clear()
+        st.view = "start"
         st.operation = None; st.progress_current = st.progress_total = 0; st.started_at = None
         try:
+            idle = max(1, self.cfg.session_timeout // 3600)
+            unit = "hour" if idle == 1 else "hours"
+            timeout_text = (
+                "⏰ <b>Session timed out</b>\n\nTemporary files and the unfinished workflow were "
+                f"removed after {idle} {unit} of inactivity. Valid direct-link files remain until "
+                "their link expires. Send the media/URL again to redo the task."
+            )
             ui = await self._get_ui_message(uid)
-            timeout_text = "⏰ <b>Session timed out</b>\n\nTemporary files and the unfinished workflow were removed after 6 hours of inactivity. Valid direct-link files remain until their link expires. Send the media/URL again to redo the task."
             if ui:
                 await self.safe_edit(ui, timeout_text, buttons=[[Button.inline("🏠 Start", b"start:home")]], parse_mode="html")
             else:
@@ -217,10 +303,15 @@ class MediaToolsBot:
         except Exception:
             pass
 
-    def cleanup_user_files(self, uid: int) -> None:
-        # Keep files still referenced by a valid Direct/Stream Link; those are
-        # removed by the link-expiry task instead. Everything else belonging
-        # to this user is safe to delete after the job completes.
+    def cleanup_user_files(self, uid: int, force: bool = False) -> None:
+        """Remove a user's temporary files.
+
+        Files referenced by a valid Direct/Stream Link are protected and removed
+        by the link-expiry task instead. Users who enabled "Keep Files" only
+        get their directory cleared when a cleanup is explicitly forced.
+        """
+        if not force and self.db.get_keep_files(int(uid)):
+            return
         protected = self.db.active_direct_paths(int(time.time()))
         for root in (self.cfg.download_dir / str(uid), self.cfg.work_dir / str(uid)):
             try:
@@ -248,14 +339,15 @@ class MediaToolsBot:
         for uid, st in self.states.items():
             if st.busy:
                 username = self.db.get_username(uid) or str(uid)
-                rows.append((st.started_at or 0, username, 1))
+                running = int(st.task is not None and not st.task.done())
+                rows.append((st.started_at or 0, username, running))
         rows.sort(reverse=True)
         if not rows:
             return "🧭 <b>Ongoing Processes</b>\n\nNo ongoing processes."
         lines = ["🧭 <b>Ongoing Processes</b>", "", "<b>User — Processes</b>"]
         for _, username, count in rows:
-            handle = f"@{username.lstrip('@')}" if username and username != str(username).strip().isdigit() else username
-            lines.append(f"• {handle} — {count}")
+            handle = f"@{username.lstrip('@')}" if not username.lstrip("@").isdigit() else username
+            lines.append(f"• {esc(handle)} — {count}")
         lines.append("\nOnly one process is allowed per normal user.")
         return "\n".join(lines)
 
@@ -298,10 +390,25 @@ class MediaToolsBot:
             st.status_chat_id = None
 
     async def safe_edit(self, msg: Message, text: str, buttons=None, **kwargs):
+        """Edit a message, tolerating both no-op edits and hard failures.
+
+        Any exception other than "not modified" is swallowed so a deleted or
+        inaccessible message never aborts the surrounding workflow.
+        """
         try:
             return await msg.edit(text, buttons=buttons, **kwargs)
         except MessageNotModifiedError:
             return None
+        except Exception as exc:
+            log.debug("edit failed: %s", exc)
+            return None
+
+    async def answer(self, event, text: str, alert: bool = False) -> None:
+        """Send a short reply without assuming a message context exists."""
+        try:
+            await event.respond(text, alert=alert)
+        except Exception:
+            pass
 
     def _set_busy(self, uid: int) -> asyncio.Event:
         st = self.state(uid)
@@ -316,24 +423,102 @@ class MediaToolsBot:
         if st.task is asyncio.current_task():
             st.task = None
 
+    def begin_job(self, uid: int, label: str) -> asyncio.Event:
+        """Mark a media job as running for a user.
+
+        ``st.task`` is the coroutine that owns the job so Cancel can interrupt
+        it, and the download queue is paused so a freshly finished download
+        cannot replace the input file mid-operation.
+        """
+        st = self.state(uid)
+        st.cancel_event = asyncio.Event()
+        st.task = asyncio.current_task()
+        st.operation = label
+        st.progress_current = 0
+        st.progress_total = 0
+        st.started_at = time.monotonic()
+        st.queue.paused = True
+        return st.cancel_event
+
+    def end_job(self, uid: int) -> None:
+        st = self.state(uid)
+        st.queue.paused = False
+        if st.task is asyncio.current_task():
+            st.task = None
+        st.operation = None
+        st.progress_current = st.progress_total = 0
+        st.started_at = None
+
+    def refresh_activity(self, uid: int) -> None:
+        """Keep the idle timer alive while a long job is making progress."""
+        st = self.state(uid)
+        st.last_activity = time.monotonic()
+        if st.timeout_task and not st.timeout_task.done():
+            st.timeout_task.cancel()
+        st.timeout_task = asyncio.create_task(self._timeout_watch(uid, st.last_activity))
+
     async def progress_message(self, msg: Message, uid: int | None = None, operation: str | None = None):
         def hook(current, total, label):
             if uid is not None:
+                self.refresh_activity(uid)
                 st = self.state(uid)
                 st.operation = operation or label
                 st.progress_current = int(current or 0)
                 st.progress_total = int(total or 0)
-                st.last_activity = time.monotonic()
-                if st.started_at is None:
-                    st.started_at = time.monotonic()
-                if st.timeout_task and not st.timeout_task.done():
-                    st.timeout_task.cancel()
-                st.timeout_task = asyncio.create_task(self._timeout_watch(uid, st.last_activity))
         return ProgressReporter(
             lambda text: self.safe_edit(msg, text, buttons=cancel_menu()),
             self.cfg.progress_interval,
             progress_hook=hook,
         )
+
+    def make_ffmpeg_job(self, uid: int, fn, source: Path | None = None):
+        """Build a job callable for ``execute`` that reports FFmpeg progress.
+
+        FFmpeg emits progress from a reader thread, so the position is only
+        recorded here; ``execute`` owns the coroutine that turns it into
+        throttled Telegram message edits.
+        """
+        reporter_holder: dict[str, ProgressReporter] = {}
+
+        def job(reporter=None) -> Path:
+            if reporter is not None:
+                reporter_holder["r"] = reporter
+            total = 0.0
+            if source is not None:
+                try:
+                    total = ffmpeg.duration(source)
+                except Exception:
+                    total = 0.0
+
+            def sink(seconds: float) -> None:
+                rep = reporter_holder.get("r")
+                if rep is None:
+                    return
+                try:
+                    rep.queue_progress(int(seconds * 1000), int(total * 1000) if total > 0 else 0)
+                except Exception:
+                    pass
+
+            try:
+                return fn(sink)
+            except TypeError:
+                return fn()
+
+        return job
+
+    async def _flush_ffmpeg_progress(self, reporter: ProgressReporter, label: str, stop: asyncio.Event) -> None:
+        """Turn queued FFmpeg positions into throttled message edits."""
+        try:
+            while not stop.is_set():
+                await asyncio.sleep(2.0)
+                current, total = reporter.take_pending()
+                if current is None:
+                    continue
+                await reporter.update(current, total, label)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.debug("progress flush stopped", exc_info=True)
 
     async def _get_ui_message(self, uid: int):
         st = self.state(uid)
@@ -344,49 +529,73 @@ class MediaToolsBot:
         except Exception:
             return None
 
+    async def _resolve_ui_message(self, st: UserState, chat_id: int, kind: str, source):
+        """Find the message that should be reused for this screen.
+
+        Reusing a single message is what keeps the chat free of dozens of
+        near-identical menu messages. When the tracked message is gone (deleted
+        by the user, or a stale id from a previous deploy) ``None`` is
+        returned so the caller sends a fresh one instead of failing.
+        """
+        if source is not None:
+            return source
+        candidates = []
+        if kind == "start":
+            if st.start_message_id and st.start_chat_id:
+                candidates.append((st.start_chat_id, st.start_message_id))
+        else:
+            if st.menu_message_id and st.menu_chat_id:
+                candidates.append((st.menu_chat_id, st.menu_message_id))
+            # Adopt the start dashboard for the first menu so a single message
+            # is reused instead of leaving an orphan behind.
+            if st.start_message_id and st.start_chat_id:
+                candidates.append((st.start_chat_id, st.start_message_id))
+        for cid, mid in candidates:
+            try:
+                msg = await self.client.get_messages(cid, ids=mid)
+            except Exception:
+                continue
+            if msg:
+                return msg
+        return None
+
     async def render_ui(self, chat_id: int, uid: int, text: str, buttons=None, parse_mode=None, link_preview=False, source=None, kind="menu"):
         st = self.state(uid)
         if kind != "start":
             self.touch(uid)
-        if kind == "start":
-            msg = source
-            if msg is None and st.start_message_id and st.start_chat_id:
-                try:
-                    msg = await self.client.get_messages(st.start_chat_id, ids=st.start_message_id)
-                except Exception:
-                    msg = None
-        else:
-            msg = source
-            if msg is None and st.menu_message_id and st.menu_chat_id:
-                try:
-                    msg = await self.client.get_messages(st.menu_chat_id, ids=st.menu_message_id)
-                except Exception:
-                    msg = None
+        msg = await self._resolve_ui_message(st, chat_id, kind, source)
         if msg is not None:
-            try:
-                await self.safe_edit(msg, text, buttons=buttons, parse_mode=parse_mode, link_preview=link_preview)
-                if kind == "start":
-                    st.start_chat_id = chat_id; st.start_message_id = msg.id
-                else:
-                    st.menu_chat_id = chat_id; st.menu_message_id = msg.id
-                    st.ui_chat_id = chat_id; st.ui_message_id = msg.id
+            edited = await self.safe_edit(msg, text, buttons=buttons, parse_mode=parse_mode, link_preview=link_preview)
+            if edited is not None:
+                st.view = kind
+                self._remember_ui(st, chat_id, kind, msg)
                 return msg
-            except Exception:
-                pass
+            # The message could not be reused (deleted/too old); start fresh.
         msg = await self.client.send_message(chat_id, text, buttons=buttons, parse_mode=parse_mode, link_preview=link_preview)
-        if kind == "start":
-            st.start_chat_id = chat_id; st.start_message_id = msg.id
-        else:
-            st.menu_chat_id = chat_id; st.menu_message_id = msg.id
-            st.ui_chat_id = chat_id; st.ui_message_id = msg.id
+        st.view = kind
+        self._remember_ui(st, chat_id, kind, msg)
         return msg
+
+    def _remember_ui(self, st: UserState, chat_id: int, kind: str, msg) -> None:
+        if kind == "start":
+            st.start_chat_id = chat_id
+            st.start_message_id = msg.id
+        else:
+            st.menu_chat_id = chat_id
+            st.menu_message_id = msg.id
+            st.ui_chat_id = chat_id
+            st.ui_message_id = msg.id
 
     async def send_help(self, entity, uid: int, source=None):
         text = (
             "<b>📚 Media Tools Bot — Help</b>\n\n"
             "<b>📥 Input</b>\n"
-            "• Send a Telegram media/document or an HTTP/HTTPS URL.\n"
-            "• URL input uses the same processing workflow as Telegram media.\n\n"
+            "• Send a Telegram media/document or an HTTP/HTTPS URL — a link inside a longer message works too.\n"
+            "• The action menu appears <b>immediately</b> and files keep downloading in the background.\n\n"
+            "<b>📥 Bulk mode</b> (Settings → Bulk Mode)\n"
+            "• Turn it on and the bot asks you to keep sending files after every one it receives.\n"
+            "• Several files transfer in parallel while you pick an action.\n"
+            "• <b>Done Adding</b> opens the normal menu; <b>Upload All</b> sends everything at once.\n\n"
             "<b>🛠️ Processing</b>\n"
             "• Video/audio stream remove and extract\n"
             "• Detailed Media Information → Telegraph\n"
@@ -404,17 +613,18 @@ class MediaToolsBot:
             "• Rename before upload\n"
             "• Default upload destination\n"
             "• Document/Media upload mode\n"
+            "• Bulk mode, delete-after-upload, keep-files\n"
             "• Permanent custom Telegram thumbnail\n\n"
             "<b>🔗 Direct links</b>\n"
             "• The bot can serve a downloaded file over HTTP with browser playback, downloads and Range requests.\n"
             "• Direct-linked files are retained for 24 hours by default.\n\n"
             "<b>🧹 Cleanup</b>\n"
             "• Temporary files are removed when a task completes or is cancelled.\n"
-            "• Idle media sessions expire after 6 hours.\n\n"
+            "• Idle media sessions expire automatically.\n\n"
             "<b>Commands</b>\n"
-            "<code>/start</code> <code>/help</code> <code>/settings</code> <code>/upload</code> <code>/urlupload</code> <code>/merge</code> <code>/direct</code> <code>/cancel</code>\n"
+            "<code>/start</code> <code>/help</code> <code>/settings</code> <code>/upload</code> <code>/urlupload</code> <code>/merge</code> <code>/direct</code> <code>/cancel</code> <code>/status</code>\n"
             "<code>/rename on|off</code> <code>/uploadmode telegram|gofile|choose</code>\n"
-            "<code>/setgofile TOKEN</code> <code>/cleargofile</code>\n\n"
+            "<code>/bulk on|off</code> <code>/setgofile TOKEN</code> <code>/cleargofile</code>\n\n"
             "Use Back to return to the previous dashboard."
         )
         buttons=[[Button.inline("⬅️ Back", b"start:home")]]
@@ -449,20 +659,33 @@ class MediaToolsBot:
         rename = self.db.get_rename(uid)
         mode = self.db.get_upload_mode(uid)
         telegram_mode = self.db.get_telegram_mode(uid)
+        bulk = self.db.get_bulk_mode(uid)
+        auto_delete = self.db.get_auto_delete(uid)
+        keep_files = self.db.get_keep_files(uid)
         mode_label = {"telegram": "Telegram", "gofile": "GoFile", "choose": "Choose before upload"}[mode]
         tg_label = "Document" if telegram_mode == "document" else "Media"
         thumb = self.db.get_thumbnail(uid)
+        parallel = max(1, self.cfg.max_parallel_downloads)
         text = (
             "⚙️ <b>Settings</b>\n\n"
             f"✏️ <b>Rename File:</b> {'Yes' if rename else 'No'}\n"
             f"📤 <b>Upload Destination:</b> {mode_label}\n"
             f"📄 <b>Telegram Upload:</b> {tg_label}\n"
-            f"🖼️ <b>Custom Thumbnail:</b> {'Set' if thumb else 'Not set'}"
+            f"📥 <b>Bulk Mode:</b> {'On — you will be asked to send more files' if bulk else 'Off'}\n"
+            f"🧹 <b>Delete After Upload:</b> {'On' if auto_delete else 'Off'}\n"
+            f"📦 <b>Keep Files:</b> {'On — temporary files are preserved' if keep_files else 'Off'}\n"
+            f"🖼️ <b>Custom Thumbnail:</b> {'Set' if thumb else 'Not set'}\n\n"
+            f"<i>Parallel downloads: {parallel} • Max download: {self.cfg.max_download_mb} MiB</i>"
         )
-        return await self.render_ui(entity, uid, text, buttons=settings_menu(rename, mode, telegram_mode, bool(thumb)), parse_mode="html", source=source, kind="start")
+        return await self.render_ui(
+            entity, uid, text,
+            buttons=settings_menu(rename, mode, telegram_mode, bool(thumb), bulk, auto_delete, keep_files),
+            parse_mode="html", source=source, kind="start",
+        )
 
     async def send_bot_status(self, entity, uid: int, source=None):
         st = self.state(uid)
+        total, done, running, failed = st.queue.summary()
         text = (
             "<b>📊 Bot Status</b>\n\n"
             "<b>Transport:</b> MTProto / Telethon\n"
@@ -471,11 +694,13 @@ class MediaToolsBot:
             f"<b>FFprobe:</b> {'OK' if shutil.which('ffprobe') else 'MISSING'}\n"
             f"<b>Direct link server:</b> {'Configured' if self.cfg.public_base_url else 'Needs PUBLIC_BASE_URL'}\n"
             f"<b>Your job:</b> {'Running' if st.busy else 'Idle'}\n"
-            f"<b>Pending workflow:</b> {st.pending or 'None'}\n"
-            f"<b>Current operation:</b> {st.operation or 'None'}\n"
-            f"<b>Current file:</b> {st.path.name if st.path else 'None'}\n"
+            f"<b>Pending workflow:</b> {esc(st.pending) or 'None'}\n"
+            f"<b>Current operation:</b> {esc(st.operation) or 'None'}\n"
+            f"<b>Current file:</b> {esc(st.path.name) if st.path else 'None'}\n"
+            f"<b>Download queue:</b> {total} total / {done} ready / {running} active"
+            + (f" / {failed} failed" if failed else "") + "\n"
             f"<b>Merge inputs:</b> {len(st.merge_inputs)}\n"
-            f"<b>Global concurrency:</b> {self.cfg.max_concurrent_jobs}"
+            f"<b>Global concurrency:</b> {self.cfg.max_concurrent_jobs} (FFmpeg: {self.cfg.max_ffmpeg_jobs})"
         )
         buttons=[[Button.inline("🖥️ System Stats", b"start:stats"), Button.inline("🏠 Start", b"start:home")]]
         if self.is_sudo(uid): buttons.append([Button.inline("🛡️ Admin Controls", b"admin:menu")])
@@ -537,6 +762,9 @@ class MediaToolsBot:
             await self.process_url(event.chat_id, uid, text)
         elif event.message.media:
             await self.receive_media(event)
+        elif extract_url(text):
+            # A link embedded in a sentence is still a download request.
+            await self.process_url(event.chat_id, uid, extract_url(text))
         elif text:
             await self.handle_text(event, text)
 
@@ -584,12 +812,22 @@ class MediaToolsBot:
                 await self.admin_cancel_user(event.chat_id, uid, arg)
         elif cmd == "/broadcast":
             if not self.is_sudo(uid):
-                await event.reply("❌ Sudo only.")
+                await event.reply("Sudo only.")
             elif not arg:
-                st.pending_admin_action = "broadcast"
-                await self.render_ui(event.chat_id, uid, "📢 <b>Broadcast</b>\n\nSend the message to broadcast to all registered users.", buttons=[[Button.inline("Cancel", b"cancel")]], parse_mode="html")
+                self.state(uid).pending_admin_action = "broadcast"
+                await self.render_ui(
+                    event.chat_id, uid,
+                    "📢 <b>Broadcast</b>\n\nSend the message to broadcast to all registered users.",
+                    buttons=[[Button.inline("Cancel", b"cancel")]], parse_mode="html",
+                )
             else:
                 await self.admin_broadcast(event.chat_id, uid, arg)
+        elif cmd == "/bulk":
+            if arg.lower() not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
+                await event.reply("Usage: /bulk on or /bulk off")
+            else:
+                self.db.set_bulk_mode(uid, arg.lower() in ("on", "yes", "true", "1"))
+                await self.send_settings(event.chat_id, uid)
         elif cmd == "/rename":
             if arg.lower() not in ("on", "off", "yes", "no", "true", "false", "1", "0"):
                 await event.reply("Usage: /rename on or /rename off")
@@ -614,6 +852,232 @@ class MediaToolsBot:
         else:
             await event.reply("Unknown command. Use /start.")
 
+    # ------------------------------------------------------------------
+    # Background download pipeline
+    # ------------------------------------------------------------------
+    def cancel_downloads(self, uid: int) -> None:
+        """Stop every in-flight/queued download for a user."""
+        st = self.state(uid)
+        st.queue_cancel.set()
+        st.queue.clear()
+        for task in list(st.download_tasks):
+            task.cancel()
+        st.download_tasks.clear()
+        if st.panel_task and not st.panel_task.done():
+            st.panel_task.cancel()
+        st.panel_task = None
+        if st.worker_task and not st.worker_task.done():
+            st.worker_task.cancel()
+        st.worker_task = None
+        st.queue_cancel = asyncio.Event()
+
+    def _ensure_panel(self, uid: int) -> None:
+        """Keep the queue panel ticking while downloads are in flight."""
+        st = self.state(uid)
+        if st.panel_task and not st.panel_task.done():
+            return
+        st.panel_task = asyncio.create_task(self._panel_loop(uid))
+
+    async def _panel_loop(self, uid: int) -> None:
+        st = self.state(uid)
+        try:
+            while st.queue.has_work():
+                # Only repaint while the user is actually looking at the queue;
+                # if they navigated into a submenu the progress is still
+                # tracked, it just must not overwrite their current screen.
+                if st.view == "queue":
+                    await self._render_queue_panel(uid, chat_id=st.ui_chat_id or uid)
+                await asyncio.sleep(PANEL_INTERVAL)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("queue panel failed for user %s", uid)
+        finally:
+            st.panel_task = None
+
+    async def _render_queue_panel(self, uid: int, chat_id: int, source=None, force: bool = False):
+        """Repaint the download screen.
+
+        Bulk users get the queue panel with its own keyboard; everyone else
+        gets the regular action menu with a download hint above it, so the
+        familiar buttons stay in place while the transfer runs.
+        """
+        st = self.state(uid)
+        if not force and st.view != "queue":
+            return None
+        bulk = self.db.get_bulk_mode(uid)
+        total, done, running, failed = st.queue.summary()
+        if not bulk:
+            pending = st.queue.pending() + st.queue.running()
+            if pending and not st.path:
+                lines = ["📥 <b>Downloading…</b>", ""]
+                for entry in pending[:5]:
+                    lines.append(f"⏳ <b>{esc(entry.display_name[:50])}</b>")
+                lines += ["", "<i>You can already pick an action below; the download continues in the background.</i>"]
+                return await self.render_ui(chat_id, uid, "\n".join(lines), buttons=main_menu(), parse_mode="html", source=source, kind="menu")
+            return await self.show_file_menu(chat_id, uid, st.path, source=source)
+        active = st.path.name if st.path else None
+        text = render_queue(st.queue, active, bulk=True)
+        return await self.render_ui(chat_id, uid, text, buttons=bulk_menu(done, running), parse_mode="html", source=source, kind="queue")
+
+    async def enqueue_input(self, chat_id: int, uid: int, item: QueueItem, source=None) -> QueueItem:
+        """Accept a new input and start downloading it in the background.
+
+        The action menu is rendered immediately so the user never waits for a
+        transfer just to see what they can do next.
+        """
+        st = self.state(uid)
+        st.queue.add(item)
+        st.view = "queue"
+        st.queue_cancel.clear()
+        await self._render_queue_panel(uid, chat_id, source=source, force=True)
+        self._ensure_panel(uid)
+        if not st.worker_task or st.worker_task.done():
+            st.worker_task = asyncio.create_task(self._queue_worker(uid))
+        return item
+
+    async def _queue_worker(self, uid: int) -> None:
+        st = self.state(uid)
+        try:
+            while True:
+                item = st.queue.claim()
+                if item is None:
+                    if not st.queue.has_work():
+                        break
+                    # Either the parallel limit is reached or a media job
+                    # paused the queue; wait for a slot instead of spinning.
+                    await asyncio.sleep(PANEL_INTERVAL)
+                    continue
+                task = asyncio.create_task(self._run_queue_item(uid, item))
+                st.download_tasks.add(task)
+                task.add_done_callback(st.download_tasks.discard)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("download worker failed for user %s", uid)
+
+    async def _run_queue_item(self, uid: int, item: QueueItem) -> None:
+        st = self.state(uid)
+        chat_id = st.ui_chat_id or uid
+        try:
+            async with self.semaphore:
+                if item.kind == "url":
+                    path = await self._download_url_item(uid, item)
+                else:
+                    path = await self._download_telegram_item(uid, item)
+            if not path or not path.exists() or path.stat().st_size == 0:
+                raise RuntimeError("The transfer produced an empty file")
+            item.path = path
+            st.queue.release(item)
+            self._promote_item(st, path, item)
+        except asyncio.CancelledError:
+            if item.path is not None:
+                item.path.unlink(missing_ok=True)
+            st.queue.mark_failed(item, "cancelled")
+            raise
+        except Exception as exc:
+            log.warning("download failed for %s: %s", item.display_name, exc)
+            st.queue.mark_failed(item, error_text(exc, 160))
+        finally:
+            with contextlib.suppress(Exception):
+                if st.view == "queue" and st.queue.has_work():
+                    await self._render_queue_panel(uid, chat_id, force=True)
+            with contextlib.suppress(Exception):
+                if not st.queue.has_work() and st.view == "queue":
+                    await self.show_file_menu(chat_id, uid, st.path)
+
+    def _promote_item(self, st: UserState, path: Path, item: QueueItem) -> None:
+        """Make a freshly downloaded file the active one, if nothing is running."""
+        if st.busy:
+            return
+        st.path = path
+        st.source_path = path
+        st.root_path = path
+        st.original_name = item.display_name
+        st.outputs = [path]
+        st.streams = []
+
+    async def _download_url_item(self, uid: int, item: QueueItem) -> Path:
+        st = self.state(uid)
+        dest = self.cfg.download_dir / str(uid)
+
+        async def cb(current: int, total: int) -> None:
+            if st.queue_cancel.is_set():
+                raise asyncio.CancelledError
+            item.current = int(current or 0)
+            item.total = int(total or 0)
+            self.refresh_activity(uid)
+
+        return await download_url(
+            item.url, dest, cb, st.queue_cancel, max_bytes=self.download_limit,
+        )
+
+    async def _download_telegram_item(self, uid: int, item: QueueItem) -> Path:
+        st = self.state(uid)
+        dest = self.cfg.download_dir / str(uid)
+        message = item.message
+        if message is None:
+            message = await self.client.get_messages(item.chat_id, ids=item.message_id)
+        if message is None:
+            raise RuntimeError("The original Telegram message is no longer available")
+        file = getattr(message, "file", None)
+        if file is None:
+            raise RuntimeError("This message no longer contains a file")
+        out = unique_path(dest, item.display_name)
+
+        async def cb(current: int, total: int) -> None:
+            if st.queue_cancel.is_set():
+                raise asyncio.CancelledError
+            item.current = int(current or 0)
+            item.total = int(total or item.expected_size or 0)
+            self.refresh_activity(uid)
+
+        result = await self.client.download_media(message, file=str(out), progress_callback=cb)
+        if not result:
+            raise RuntimeError("Telegram returned no downloaded file")
+        return out
+
+    async def show_file_menu(self, chat_id: int, uid: int, path: Path | None, source=None, plain: bool = False):
+        st = self.state(uid)
+        if path is None:
+            st.path = st.source_path = st.root_path = None
+            st.outputs.clear()
+            st.streams.clear()
+            return await self.send_main(chat_id, uid, source=source)
+        st.view = "menu"
+        bulk = self.db.get_bulk_mode(uid)
+        archive_note = "\n📦 <b>Archive detected:</b> Extract Archive is available." if is_archive(path) else ""
+        inflight = st.queue.pending() + st.queue.running()
+        hint = f"\n⬇️ <i>{len(inflight)} more file(s) still downloading in the background.</i>" if inflight else ""
+        # In bulk mode the prompt tells the user to press "Done Adding", so the
+        # matching bulk keyboard has to be shown with it. "Done Adding" passes
+        # plain=True to leave bulk collection behind.
+        bulk_active = bool(bulk and not plain and (st.queue.finished() or inflight))
+        if bulk_active:
+            text = render_bulk_prompt(st.queue, path)
+            if inflight:
+                text += hint
+            buttons = bulk_menu(len(st.queue.finished()), len(st.queue.running()))
+        else:
+            text = (
+                f"📁 <b>{esc(path.name)}</b>\n{format_bytes(self._safe_size(path))}{archive_note}{hint}"
+                "\n\nPlease select your preferred action below 👇"
+            )
+            buttons = main_menu()
+        # Reuse the message that is already showing the queue so the screen
+        # updates in place instead of leaving a second menu behind.
+        msg = await self._resolve_ui_message(st, chat_id, "menu", source)
+        if msg is not None:
+            edited = await self.safe_edit(msg, text, buttons=buttons, parse_mode="html")
+            if edited is not None:
+                st.menu_chat_id = chat_id
+                st.menu_message_id = msg.id
+                st.ui_chat_id = chat_id
+                st.ui_message_id = msg.id
+                self.touch(uid)
+                return msg
+        return await self.render_ui(chat_id, uid, text, buttons=buttons, parse_mode="html", source=source, kind="menu")
+
     async def receive_media(self, event):
         uid = event.sender_id
         st = self.state(uid)
@@ -629,37 +1093,18 @@ class MediaToolsBot:
         if st.busy:
             await event.reply("⚠️ A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
-        st.cancel_event = asyncio.Event()
-        st.task = asyncio.current_task()
-        file = event.message.file
-        name = safe_filename(file.name if file and file.name else f"telegram_{event.message.id}.bin")
-        user_dir = self.cfg.download_dir / str(uid)
-        out = unique_path(user_dir, name)
-        status = await self.new_status_message(event.chat_id, f"📥 Preparing download...\n{name}", buttons=cancel_menu())
-        reporter = await self.progress_message(status, uid=uid)
-        try:
-            async with self.semaphore:
-                async def cb(cur, total):
-                    if st.cancel_event.is_set():
-                        raise asyncio.CancelledError
-                    await reporter.update(int(cur), int(total or file.size or 0), "📥 Downloading from Telegram (MTProto)")
-                result = await self.client.download_media(event.message, file=str(out), progress_callback=cb)
-                if not result:
-                    raise RuntimeError("Telegram returned no downloaded file")
-            st.path = out; st.source_path = out; st.root_path = out
-            st.original_name = name; st.outputs = [out]
-            await self.safe_edit(status, f"✅ Telegram download complete\n{format_bytes(out.stat().st_size)}", buttons=None)
-            await self.clear_status_message(uid, delete=True)
-            await self.show_file_menu(event.chat_id, uid, out)
-        except asyncio.CancelledError:
-            out.unlink(missing_ok=True)
-            await self.cancelled_status(uid, status)
-        except Exception as exc:
-            out.unlink(missing_ok=True)
-            log.exception("Telegram media download failed")
-            await self.safe_edit(status, f"❌ Telegram download failed:\n{type(exc).__name__}: {exc}", buttons=None)
-        finally:
-            self._clear_busy(uid)
+        message = event.message
+        name = guess_media_name(message, f"telegram_{getattr(message, 'id', 0)}.bin")
+        file = getattr(message, "file", None)
+        item = QueueItem(
+            kind="telegram",
+            label=name,
+            chat_id=event.chat_id,
+            message_id=getattr(message, "id", None),
+            expected_size=int(getattr(file, "size", 0) or 0) if file else 0,
+            message=message,
+        )
+        await self.enqueue_input(event.chat_id, uid, item)
 
     async def receive_custom_thumbnail(self, event):
         uid = event.sender_id
@@ -697,7 +1142,7 @@ class MediaToolsBot:
             await self.send_settings(event.chat_id, uid)
         except Exception as exc:
             target.unlink(missing_ok=True)
-            await event.reply(f"❌ Custom thumbnail failed: {type(exc).__name__}: {exc}")
+            await event.reply(f"Custom thumbnail failed: {esc(error_text(exc))}", parse_mode="html")
 
     async def process_url(self, chat_id: int, uid: int, url: str):
         st = self.state(uid)
@@ -705,41 +1150,9 @@ class MediaToolsBot:
             await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first.")
             return
         st.pending = None
-        st.cancel_event = asyncio.Event()
-        st.task = asyncio.current_task()
-        status = await self.new_status_message(chat_id, "📥 Downloading URL...", buttons=cancel_menu())
-        reporter = await self.progress_message(status, uid=uid)
-        try:
-            async def cb(cur, total):
-                if st.cancel_event.is_set():
-                    raise asyncio.CancelledError
-                await reporter.update(cur, total, "📥 Downloading URL")
-            async with self.semaphore:
-                out = await download_url(url, self.cfg.download_dir / str(uid), cb, st.cancel_event)
-            st.path = out; st.source_path = out; st.root_path = out
-            st.original_name = out.name; st.outputs = [out]
-            await self.safe_edit(status, f"✅ URL download complete\n{format_bytes(out.stat().st_size)}", buttons=None)
-            await self.clear_status_message(uid, delete=True)
-            await self.show_file_menu(chat_id, uid, out)
-        except asyncio.CancelledError:
-            await self.cancelled_status(uid, status)
-            out = locals().get("out")
-            if isinstance(out, Path): out.unlink(missing_ok=True)
-        except Exception as exc:
-            log.exception("URL download failed")
-            await self.safe_edit(status, f"❌ URL download failed:\n{type(exc).__name__}: {exc}", buttons=None)
-        finally:
-            self._clear_busy(uid)
-
-    async def show_file_menu(self, chat_id: int, uid: int, path: Path):
-        await self.delete_menu_message(uid)
-        archive_note = "\n📦 <b>Archive detected:</b> Extract Archive is available." if is_archive(path) else ""
-        await self.render_ui(
-            chat_id, uid,
-            f"📁 <b>{safe_filename(path.name)}</b>\n{format_bytes(path.stat().st_size)}{archive_note}\n\nPlease select your preferred action below 👇",
-            buttons=main_menu(), parse_mode="html",
-        )
-        self.touch(uid)
+        name = url.rsplit("/", 1)[-1].split("?")[0] or url
+        item = QueueItem(kind="url", label=safe_filename(name, "download.bin"), chat_id=chat_id, url=url)
+        await self.enqueue_input(chat_id, uid, item)
 
     async def run_archive(self, chat_id, uid, source=None):
         st = self.state(uid)
@@ -757,54 +1170,87 @@ class MediaToolsBot:
             buttons=archive_mode_menu(), parse_mode="html", source=source,
         )
 
+    @staticmethod
+    def _part_sort_key(path: Path) -> int:
+        """Order archive parts numerically, falling back to 1 for single files."""
+        info = multipart_info(path)
+        return info[1] if info else 1
+
     async def _begin_archive_extract(self, chat_id: int, uid: int, password: str | None = None):
         st = self.state(uid)
         parts = [p for p in st.archive_parts if p.exists() and p.is_file()]
         if not parts:
-            await self.render_ui(chat_id, uid, "❌ No archive parts are available.", buttons=main_menu())
+            await self.render_ui(chat_id, uid, "No archive parts are available.", buttons=main_menu())
             return
-        first = sorted(parts, key=lambda p: multipart_info(p)[1] if multipart_info(p) else 1)[0]
-        outdir = self.cfg.work_dir / str(uid) / f"extracted_{int(time.time())}"
+        first = sorted(parts, key=self._part_sort_key)[0]
+        # A timestamped directory is not unique enough: two extractions started
+        # in the same second reused the same folder and mixed their contents.
+        outdir = self.cfg.work_dir / str(uid) / f"extracted_{int(time.time())}_{secrets.token_hex(4)}"
         st.pending = None
         st.archive_password = password
-        st.cancel_event = asyncio.Event()
-        st.task = asyncio.current_task()
-        status = await self.new_status_message(chat_id, "📦 Extracting archive...", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Extracting archive\u2026", buttons=cancel_menu())
+        self.begin_job(uid, "Extracting archive")
         try:
-            async with self.semaphore:
+            # Extraction is as CPU/disk heavy as a transcode, so it shares the
+            # FFmpeg budget instead of the much larger transfer budget.
+            async with self.ffmpeg_semaphore:
                 token = process_control.set_job(uid)
                 try:
                     out = await asyncio.to_thread(extract_archive, first, outdir, password)
                 finally:
                     process_control.reset_job(token)
+            if st.cancel_event.is_set():
+                raise asyncio.CancelledError
             files = sorted(p for p in out.rglob("*") if p.is_file())
             if not files:
-                raise RuntimeError("Archive extracted successfully but contains no files")
+                raise RuntimeError("The archive was extracted but contained no files")
             st.outputs = files
             st.output_root = outdir
             st.path = files[0]
             st.source_path = first
             st.root_path = first
             st.streams = []
-            await self.safe_edit(status, f"✅ Archive extracted\n<b>Files:</b> {len(files)}", buttons=None, parse_mode="html")
-            await self.clear_status_message(uid, delete=True)
-            st.archive_parts.clear(); st.archive_series = None; st.archive_password = None; st.archive_mode = None
+            total = sum(self._safe_size(p) for p in files)
+            st.archive_parts.clear()
+            st.archive_series = None
+            st.archive_password = None
+            st.archive_mode = None
+            st.task = None
+            # Keep the confirmation on screen: deleting it immediately meant
+            # the user never saw how many files were extracted.
+            await self.safe_edit(
+                status,
+                f"<b>Archive extracted</b>\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total)}",
+                buttons=[[Button.inline("Continue", b"upload:back")]], parse_mode="html",
+            )
+            st.status_message_id = None
+            st.status_chat_id = None
+            st.queue.paused = False
             # Extraction is complete; now choose where the extracted tree goes.
             await self.choose_upload(chat_id, uid)
         except asyncio.CancelledError:
             shutil.rmtree(outdir, ignore_errors=True)
-            await self.cancelled_status(uid, status, "❌ Extraction cancelled.")
+            await self.cancelled_status(uid, status, "Extraction cancelled.")
         except Exception as exc:
             log.exception("archive extraction failed")
             shutil.rmtree(outdir, ignore_errors=True)
             text = str(exc)
-            if "password" in text.lower() or "encrypted" in text.lower():
+            if "password" in text.lower() or "encrypt" in text.lower():
                 st.pending = "archive_password"
-                await self.safe_edit(status, "🔐 <b>Archive password required</b>\n\nSend the password or choose No Password.", buttons=archive_password_menu(), parse_mode="html")
+                await self.safe_edit(
+                    status,
+                    "<b>Archive password required</b>\n\nSend the password or choose No Password.",
+                    buttons=archive_password_menu(), parse_mode="html",
+                )
+                st.status_message_id = None
+                st.status_chat_id = None
             else:
-                await self.safe_edit(status, f"❌ Extraction failed:\n{type(exc).__name__}: {exc}", buttons=[[Button.inline("⬅️ Back", b"menu:back")]])
+                await self.safe_edit(
+                    status, f"Extraction failed:\n{esc(error_text(exc))}",
+                    buttons=[[Button.inline("Back", b"menu:back")]], parse_mode="html",
+                )
         finally:
-            self._clear_busy(uid)
+            self.end_job(uid)
 
     async def begin_archive_normal(self, chat_id: int, uid: int):
         st = self.state(uid)
@@ -867,17 +1313,22 @@ class MediaToolsBot:
         if st.busy:
             await event.reply("⚠️ A process is already running. Wait for it to finish or cancel it.")
             return
-        file = event.message.file
-        name = safe_filename(file.name if file and file.name else f"archive_part_{event.message.id}.bin")
+        message = event.message
+        file = getattr(message, "file", None)
+        if file is None:
+            await event.reply("❌ That message does not contain a file.")
+            return
+        name = safe_filename(getattr(file, "name", None) or f"archive_part_{getattr(message, 'id', 0)}.bin")
         out = unique_path(self.cfg.download_dir / str(uid) / "archive_parts", name)
-        status = await self.new_status_message(event.chat_id, f"📥 Downloading archive part…\n{name}", buttons=cancel_menu())
+        status = await self.new_status_message(event.chat_id, f"📥 Downloading archive part…\n{esc(name)}", buttons=cancel_menu(), parse_mode="html")
         reporter = await self.progress_message(status, uid=uid)
-        st.cancel_event = asyncio.Event(); st.task = asyncio.current_task()
+        self.begin_job(uid, "Downloading archive part")
         try:
             async def cb(cur, total):
-                if st.cancel_event.is_set(): raise asyncio.CancelledError
-                await reporter.update(cur, int(total or file.size or 0), "📥 Downloading archive part")
-            result = await self.client.download_media(event.message, file=str(out), progress_callback=cb)
+                if st.cancel_event.is_set():
+                    raise asyncio.CancelledError
+                await reporter.update(cur, int(total or getattr(file, "size", 0) or 0), "📥 Downloading archive part")
+            result = await self.client.download_media(message, file=str(out), progress_callback=cb)
             if not result:
                 raise RuntimeError("Telegram returned no downloaded file")
             await self.clear_status_message(uid, delete=True)
@@ -887,71 +1338,81 @@ class MediaToolsBot:
             await self.cancelled_status(uid, status)
         except Exception as exc:
             out.unlink(missing_ok=True)
-            await self.safe_edit(status, f"❌ Archive part download failed: {type(exc).__name__}: {exc}", buttons=None)
+            await self.safe_edit(status, f"❌ Archive part download failed:\n{esc(error_text(exc))}", buttons=None, parse_mode="html")
         finally:
-            self._clear_busy(uid)
+            self.end_job(uid)
 
     async def process_archive_part_url(self, chat_id: int, uid: int, url: str):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Wait for it to finish or cancel it.")
+            await self.client.send_message(chat_id, "A process is already running. Wait for it to finish or cancel it.")
             return
-        st.cancel_event = asyncio.Event(); st.task = asyncio.current_task()
-        status = await self.new_status_message(chat_id, "📥 Downloading archive part URL…", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Downloading archive part URL\u2026", buttons=cancel_menu())
         reporter = await self.progress_message(status, uid=uid)
+        out = None
+        self.begin_job(uid, "Downloading archive part")
         try:
             async def cb(cur, total):
-                if st.cancel_event.is_set(): raise asyncio.CancelledError
-                await reporter.update(cur, total, "📥 Downloading archive part URL")
-            out = await download_url(url, self.cfg.download_dir / str(uid) / "archive_parts", cb, st.cancel_event)
+                if st.cancel_event.is_set():
+                    raise asyncio.CancelledError
+                await reporter.update(cur, total, "Downloading archive part URL")
+            out = await download_url(
+                url, self.cfg.download_dir / str(uid) / "archive_parts", cb, st.cancel_event,
+                max_bytes=self.download_limit,
+            )
             await self.clear_status_message(uid, delete=True)
             await self._accept_archive_part(chat_id, uid, out)
         except asyncio.CancelledError:
-            out = locals().get("out")
-            if isinstance(out, Path): out.unlink(missing_ok=True)
+            if isinstance(out, Path):
+                out.unlink(missing_ok=True)
             await self.cancelled_status(uid, status)
         except Exception as exc:
-            out = locals().get("out")
-            if isinstance(out, Path): out.unlink(missing_ok=True)
-            await self.safe_edit(status, f"❌ Archive part download failed: {type(exc).__name__}: {exc}", buttons=None)
+            if isinstance(out, Path):
+                out.unlink(missing_ok=True)
+            await self.safe_edit(status, f"Archive part download failed:\n{esc(error_text(exc))}", buttons=None, parse_mode="html")
         finally:
-            self._clear_busy(uid)
+            self.end_job(uid)
 
     async def process_merge_url(self, chat_id: int, uid: int, url: str):
         """Download an HTTP(S) URL as an additional merge input."""
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first.")
+            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
             return
-        st.cancel_event = asyncio.Event()
-        st.task = asyncio.current_task()
-        status = await self.new_status_message(chat_id, "📥 Downloading merge URL...", buttons=cancel_menu())
+        status = await self.new_status_message(chat_id, "Downloading merge URL\u2026", buttons=cancel_menu())
         reporter = await self.progress_message(status, uid=uid)
+        out = None
+        self.begin_job(uid, "Downloading merge URL")
         try:
             async def cb(cur, total):
                 if st.cancel_event.is_set():
                     raise asyncio.CancelledError
-                await reporter.update(cur, total, "📥 Downloading merge URL")
+                await reporter.update(cur, total, "Downloading merge URL")
             async with self.semaphore:
-                out = await download_url(url, self.cfg.download_dir / str(uid) / "merge", cb, st.cancel_event)
+                out = await download_url(
+                    url, self.cfg.download_dir / str(uid) / "merge", cb, st.cancel_event,
+                    max_bytes=self.download_limit,
+                )
             st.merge_inputs.append(out.resolve())
-            await self.safe_edit(status, f"✅ Added merge URL: {out.name}\nTracks queued: {len(st.merge_inputs)}", buttons=None)
+            await self.safe_edit(status, f"Added merge URL: {esc(out.name)}\nTracks queued: {len(st.merge_inputs)}", buttons=None, parse_mode="html")
             st.status_message_id = None; st.status_chat_id = None
             await self.render_ui(chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
             self.touch(uid)
         except asyncio.CancelledError:
-            await self.cancelled_status(uid, status)
-        except Exception as exc:
-            out = locals().get("out")
             if isinstance(out, Path):
                 out.unlink(missing_ok=True)
-            await self.safe_edit(status, f"❌ Merge URL download failed:\n{type(exc).__name__}: {exc}", buttons=None)
+            await self.cancelled_status(uid, status)
+        except Exception as exc:
+            if isinstance(out, Path):
+                out.unlink(missing_ok=True)
+            await self.safe_edit(status, f"Merge URL download failed:\n{esc(error_text(exc))}", buttons=None, parse_mode="html")
         finally:
-            self._clear_busy(uid)
+            self.end_job(uid)
 
     async def handle_text(self, event, text: str):
         uid = event.sender_id
         st = self.state(uid)
+        text = (text or "").strip()
         if st.pending_admin_action == "cancel_user" and self.is_sudo(uid):
             st.pending_admin_action = None
             await self.admin_cancel_user(event.chat_id, uid, text)
@@ -967,10 +1428,11 @@ class MediaToolsBot:
             await self.apply_rename_and_continue(event.chat_id, uid, text)
             return
         if st.pending == "urlupload":
-            if re.match(r"^https?://", text, re.I):
-                await self.process_url(event.chat_id, uid, text)
+            url = extract_url(text)
+            if url and re.match(r"^https?://", url, re.I):
+                await self.process_url(event.chat_id, uid, url)
             else:
-                await event.reply("Please send a valid http(s) URL.")
+                await event.reply("Please send a valid http(s) link.")
             return
         if st.pending == "trim":
             await self.run_trim(event.chat_id, uid, text, audio=False); return
@@ -984,21 +1446,54 @@ class MediaToolsBot:
             await self.run_split(event.chat_id, uid, text); return
         if st.pending == "sample":
             await self.run_sample(event.chat_id, uid, text); return
-        if st.pending == "merge_collect":
-            await event.reply(self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
-            return
         if st.pending == "audio_speed":
+            # Validate before starting the job: a ValueError raised by FFmpeg
+            # later used to be reported as "invalid speed", which is confusing.
             try:
                 factor = float(text)
-                if not 0.5 <= factor <= 2.0:
-                    raise ValueError
-                await self.run_audio_filter(event.chat_id, uid, f"atempo={factor:g}", "speed")
             except ValueError:
-                await event.reply("❌ Enter a speed between 0.5 and 2.0.")
+                await event.reply("Enter a speed between 0.5 and 2.0, for example 1.25")
+                return
+            if not 0.5 <= factor <= 2.0:
+                await event.reply("Enter a speed between 0.5 and 2.0, for example 1.25")
+                return
+            await self.run_audio_filter(event.chat_id, uid, f"atempo={factor:g}", "speed")
             return
         if st.pending == "audio_volume":
-            await self.run_audio_filter(event.chat_id, uid, f"volume={text.strip()}", "volume"); return
-        await event.reply("Send a media file or URL, or use /start.")
+            volume = self._parse_volume(text)
+            if volume is None:
+                await event.reply("Enter a volume like 1.5, 0.5 or -3dB.")
+                return
+            await self.run_audio_filter(event.chat_id, uid, f"volume={volume}", "volume")
+            return
+        if st.pending == "merge_collect":
+            # Re-render the queue screen instead of posting yet another copy
+            # of the same merge status into the chat.
+            await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
+            return
+        if st.pending in {"archive_collect", "rename_choice"}:
+            await self.answer(event, "Send a file or link, or press Cancel.")
+            return
+        await event.reply("Send a media file or an http(s) link, or use /help to see everything I can do.")
+
+    @staticmethod
+    def _parse_volume(text: str) -> str | None:
+        """Validate a volume expression before it reaches the filter graph."""
+        value = (text or "").strip()
+        if not value or len(value) > 16:
+            return None
+        if re.fullmatch(r"[+-]?\d+(\.\d+)?dB", value, re.I):
+            number = float(value[:-2])
+            if not -100 <= number <= 100:
+                return None
+            return value
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        if not 0.0 <= number <= 10.0:
+            return None
+        return f"{number:g}"
 
     async def on_callback(self, event):
         uid = event.sender_id
@@ -1015,7 +1510,7 @@ class MediaToolsBot:
         except Exception as exc:
             log.exception("callback failed")
             try:
-                await event.respond(f"❌ {type(exc).__name__}: {exc}")
+                await event.respond(f"Something went wrong: {esc(error_text(exc, 200))}")
             except Exception:
                 pass
 
@@ -1101,14 +1596,18 @@ class MediaToolsBot:
         if data == "archive:normal":
             await self.begin_archive_normal(event.chat_id, uid); return
         if data == "archive:multi":
-            # Put the first part beside the remaining parts so 7z can discover the set.
+            # 7z only discovers a multi-volume set when every part sits in the
+            # same directory. Move the first part there instead of copying it:
+            # copying a multi-gigabyte archive doubled the disk usage and made
+            # the extraction fail whenever the copy was still running.
             if st.path and st.path.exists():
                 part_dir = self.cfg.download_dir / str(uid) / "archive_parts"
                 part_dir.mkdir(parents=True, exist_ok=True)
-                copied = part_dir / st.path.name
-                if copied.resolve() != st.path.resolve():
-                    shutil.copy2(st.path, copied)
-                st.archive_parts = [copied.resolve()]
+                target = unique_path(part_dir, st.path.name)
+                if target.resolve() != st.path.resolve():
+                    shutil.move(str(st.path), str(target))
+                st.archive_parts = [target.resolve()]
+                st.path = target
             await self.begin_archive_multi(event.chat_id, uid); return
         if data == "archive:finish":
             if st.archive_mode != "multi" or not st.archive_parts:
@@ -1221,6 +1720,88 @@ class MediaToolsBot:
             st.pending = "audio_speed"; await self.safe_edit(event, "🎵 Send speed factor between 0.5 and 2.0. Example: `1.25`", buttons=cancel_menu()); return
         if data == "audio:volume":
             st.pending = "audio_volume"; await self.safe_edit(event, "🔊 Send volume expression. Example: `1.5` or `-3dB`", buttons=cancel_menu()); return
+        if data.startswith("bulk:"):
+            await self.handle_bulk_callback(event, uid, data); return
+        if data.startswith("bulkupload:"):
+            await self.handle_bulk_upload(event, uid, data.split(":", 1)[1]); return
+        if data == "upload:back":
+            await self.send_main(event.chat_id, uid, source=event); return
+        if data.startswith("settings:bulk:"):
+            self.db.set_bulk_mode(uid, data.rsplit(":", 1)[1] == "on")
+            await self.send_settings(event.chat_id, uid, source=event); return
+        if data.startswith("settings:auto_delete:"):
+            self.db.set_auto_delete(uid, data.rsplit(":", 1)[1] == "on")
+            await self.send_settings(event.chat_id, uid, source=event); return
+        if data.startswith("settings:keep_files:"):
+            self.db.set_keep_files(uid, data.rsplit(":", 1)[1] == "on")
+            await self.send_settings(event.chat_id, uid, source=event); return
+        # An unrecognised button is almost always a stale keyboard from before a
+        # restart or a completed job. Saying nothing leaves the user tapping a
+        # dead button, so point them back to a working screen.
+        await self.answer(event, "This button is out of date. Sending a fresh menu…", alert=True)
+        await self.send_start_info(event.chat_id, uid, source=event)
+
+    # ------------------------------------------------------------------
+    # Bulk mode callbacks
+    # ------------------------------------------------------------------
+    async def handle_bulk_callback(self, event, uid: int, data: str) -> None:
+        st = self.state(uid)
+        action = data.split(":", 1)[1]
+        if action == "done":
+            # Leave bulk collection: the files gathered so far become the
+            # working set, so Upload sends all of them and the action menu
+            # operates on the most recent one.
+            ready = st.queue.ready_paths()
+            if ready:
+                st.outputs = ready
+                st.path = ready[-1]
+                st.source_path = ready[-1]
+                st.root_path = ready[-1]
+            st.queue.drop_finished()
+            st.view = "menu"
+            await self.stop_timeout(uid)
+            await self.show_file_menu(event.chat_id, uid, st.path, source=event, plain=True)
+            if len(ready) > 1:
+                await self.answer(event, f"{len(ready)} files ready — Upload sends all of them")
+            return
+        if action == "refresh":
+            st.view = "queue"
+            await self._render_queue_panel(uid, event.chat_id, source=event, force=True)
+            return
+        if action == "clear":
+            self.cancel_downloads(uid)
+            await self.answer(event, "Queue cleared", alert=True)
+            st.view = "menu"
+            await self.show_file_menu(event.chat_id, uid, None, source=event)
+            return
+        if action == "upload":
+            ready = st.queue.ready_paths()
+            if not ready:
+                await self.answer(event, "No finished files to upload yet", alert=True)
+                return
+            st.view = "queue"
+            await self.render_ui(
+                event.chat_id, uid,
+                f"📤 <b>Upload all</b>\n\n<b>Files ready:</b> {len(ready)}\n\nChoose a destination.",
+                buttons=bulk_upload_menu(len(ready)), parse_mode="html", source=event, kind="queue",
+            )
+
+    async def handle_bulk_upload(self, event, uid: int, destination: str) -> None:
+        st = self.state(uid)
+        ready = st.queue.ready_paths()
+        if not ready:
+            await self.answer(event, "No finished files to upload yet", alert=True)
+            return
+        if destination not in {"telegram", "gofile"}:
+            await self.answer(event, "Unknown upload destination", alert=True)
+            return
+        # The queue becomes the upload set, so the shared upload path (rename
+        # prompt, chunking, GoFile folders) works unchanged.
+        st.outputs = ready
+        st.path = ready[-1]
+        st.output_root = None
+        st.view = "menu"
+        await self.choose_upload(event.chat_id, uid, destination)
 
     async def audio_convert_menu(self, event):
         await self.safe_edit(event, "Choose output format", buttons=[
@@ -1326,23 +1907,27 @@ class MediaToolsBot:
     async def download_merge_input(self, event):
         uid = event.sender_id
         st = self.state(uid)
-        file = event.message.file
-        name = safe_filename(file.name if file and file.name else f"merge_{event.message.id}.bin")
+        message = event.message
+        file = getattr(message, "file", None)
+        if file is None:
+            await event.reply("That message does not contain a file.")
+            return
+        name = safe_filename(getattr(file, "name", None) or f"merge_{getattr(message, 'id', 0)}.bin")
         out = unique_path(self.cfg.download_dir / str(uid) / "merge", name)
-        status = await self.new_status_message(event.chat_id, f"📥 Adding merge track...\n{name}", buttons=cancel_menu())
+        status = await self.new_status_message(event.chat_id, f"Adding merge track\u2026\n{esc(name)}", buttons=cancel_menu(), parse_mode="html")
         reporter = await self.progress_message(status, uid=uid)
-        st.cancel_event = asyncio.Event()
-        st.task = asyncio.current_task()
+        self.begin_job(uid, "Downloading merge track")
         try:
             async def cb(cur, total):
-                if st.cancel_event.is_set(): raise asyncio.CancelledError
-                await reporter.update(int(cur), int(total or file.size or 0), "📥 Downloading merge track")
+                if st.cancel_event.is_set():
+                    raise asyncio.CancelledError
+                await reporter.update(int(cur), int(total or getattr(file, "size", 0) or 0), "Downloading merge track")
             async with self.semaphore:
-                result = await self.client.download_media(event.message, file=str(out), progress_callback=cb)
+                result = await self.client.download_media(message, file=str(out), progress_callback=cb)
             if not result or not out.exists() or out.stat().st_size == 0:
                 raise RuntimeError("Telegram returned no downloaded merge track")
             st.merge_inputs.append(out.resolve())
-            await self.safe_edit(status, f"✅ Added: {name}\nTracks queued: {len(st.merge_inputs)}", buttons=None)
+            await self.safe_edit(status, f"Added: {esc(name)}\nTracks queued: {len(st.merge_inputs)}", buttons=None, parse_mode="html")
             st.status_message_id = None; st.status_chat_id = None
             await self.render_ui(event.chat_id, uid, self.merge_status_text(st), buttons=merge_menu(), parse_mode="html")
             self.touch(uid)
@@ -1351,28 +1936,9 @@ class MediaToolsBot:
             await self.cancelled_status(uid, status)
         except Exception as exc:
             out.unlink(missing_ok=True)
-            await self.safe_edit(status, f"❌ Failed to add merge track: {exc}", buttons=None)
+            await self.safe_edit(status, f"Failed to add merge track: {esc(error_text(exc))}", buttons=None, parse_mode="html")
         finally:
-            self._clear_busy(uid)
-
-    def merge_status_text(self, st: UserState) -> str:
-        valid = [Path(p) for p in st.merge_inputs if Path(p).exists()]
-        rows = []
-        for i, p in enumerate(valid, 1):
-            try:
-                size = format_bytes(p.stat().st_size)
-            except OSError:
-                size = "unknown size"
-            rows.append(f"<b>{i}.</b> {safe_filename(p.name)} — {size}")
-        listing = "\n".join(rows) if rows else "<i>No files queued yet.</i>"
-        return (
-            "📦 <b>Merge Tracks</b>\n\n"
-            f"<b>Files queued: {len(valid)}</b>\n"
-            f"{listing}\n\n"
-            "Send another Telegram media file or HTTP/HTTPS URL to add it. "
-            "When you are done, press <b>Finish Merge</b>.\n\n"
-            "This combines tracks/streams into one MKV; it does not concatenate timelines."
-        )
+            self.end_job(uid)
 
     async def start_merge(self, chat_id, uid, source=None):
         st = self.state(uid)
@@ -1439,11 +2005,16 @@ class MediaToolsBot:
         st = self.state(uid)
         path = st.path
         if not path or not path.exists():
-            await self.client.send_message(chat_id, "❌ Send or download a media file first."); return
+            await self.client.send_message(chat_id, "Send or download a media file first.")
+            return
         if not self.cfg.public_base_url:
             await self.client.send_message(
                 chat_id,
-                "❌ I cannot safely invent a public URL for this server.\n\nSet <code>PUBLIC_BASE_URL</code> to your public HTTPS origin. Railway/Render domains are detected automatically when their standard environment variable is available.\n\nThe service must expose <code>WEB_PORT</code> (default 8080) publicly.",
+                "I cannot safely invent a public URL for this server.\n\n"
+                "Set <code>PUBLIC_BASE_URL</code> to your public HTTPS origin. "
+                "Railway/Render domains are detected automatically when their "
+                "standard environment variable is available.\n\n"
+                "The service must expose <code>WEB_PORT</code> (default 8080) publicly.",
                 parse_mode="html",
             )
             return
@@ -1451,112 +2022,148 @@ class MediaToolsBot:
         token = secrets.token_urlsafe(18)
         expires = int(time.time()) + self.cfg.direct_link_ttl
         self.db.add_direct_link(token, uid, str(path.resolve()), expires)
-        from urllib.parse import quote
         link = f"{self.cfg.public_base_url}/f/{token}/{quote(path.name)}"
+        hours = max(1, self.cfg.direct_link_ttl // 3600)
         await self.render_ui(
             chat_id, uid,
-            f"🔗 <b>Direct/Stream Link</b>\n\n<a href=\"{link}\">{link}</a>\n\nExpires: {self.cfg.direct_link_ttl // 3600} hours\nThe link supports browser playback/download and HTTP Range requests.",
-            buttons=[[Button.inline("⬅️ Back", b"menu:back")]], parse_mode="html", link_preview=True, source=source
+            f"\U0001F517 <b>Direct/Stream Link</b>\n\n<a href=\"{link}\">{esc(link)}</a>\n\n"
+            f"Expires in {hours} hours. The link supports browser playback, download "
+            "and HTTP Range requests.",
+            buttons=[[Button.inline("\u2B05\uFE0F Back", b"menu:back")]],
+            parse_mode="html", link_preview=True, source=source,
         )
-        asyncio.create_task(self._cleanup_direct_link_later(token, path, self.cfg.direct_link_ttl))
-
-    async def _cleanup_direct_link_later(self, token: str, path: Path, ttl: int) -> None:
-        try:
-            await asyncio.sleep(max(1, ttl))
-            row = self.db.get_direct_link(token)
-            if row and int(row[2]) <= int(time.time()):
-                self.db.purge_direct_links(int(time.time()))
-                if str(path.resolve()) not in self.db.active_direct_paths(int(time.time())) and path.exists():
-                    path.unlink(missing_ok=True)
-        except asyncio.CancelledError:
-            return
-        except Exception:
-            log.exception("direct-link cleanup failed")
+        # Expiry is handled by _direct_cleanup_loop, which also survives a bot
+        # restart. Spawning one sleeping task per link used to leak thousands of
+        # tasks for an active deployment.
 
     async def run_info(self, chat_id, uid, source=None):
         st = self.state(uid)
         path = self.source_media(st) or st.path
         if not path or not path.exists():
-            await self.render_ui(chat_id, uid, "❌ Send a media file first.", buttons=main_menu())
+            await self.render_ui(chat_id, uid, "Send a media file first.", buttons=main_menu())
             return
-        status = await self.render_ui(chat_id, uid, "📋 Collecting detailed media information…", buttons=cancel_menu(), source=source)
+        status = await self.render_ui(chat_id, uid, "Collecting detailed media information\u2026", buttons=cancel_menu(), source=source)
+        self.begin_job(uid, "Reading media information")
         try:
             data = await asyncio.to_thread(ffprobe.probe, path)
             packet_sizes = await asyncio.to_thread(ffprobe.stream_packet_sizes, path)
             page = await create_info_page(
                 data, path.name, format_bytes(path.stat().st_size),
-                self.cfg.telegraph_access_token, packet_sizes=packet_sizes
+                self.cfg.telegraph_access_token, packet_sizes=packet_sizes,
             )
-            text = f"📋 <b>{safe_filename(path.name)}</b>\n\n🔗 <a href=\"{page}\">Open detailed Media Information</a>"
-            await self.safe_edit(status, text, buttons=[[Button.inline("⬅️ Back", b"video:back")]], parse_mode="html", link_preview=False)
+            text = f"\U0001F4CB <b>{esc(path.name)}</b>\n\n\U0001F517 <a href=\"{page}\">Open detailed Media Information</a>"
+            await self.safe_edit(status, text, buttons=[[Button.inline("\u2B05\uFE0F Back", b"video:back")]], parse_mode="html", link_preview=False)
             self.state(uid).status_message_id = None
             self.state(uid).status_chat_id = None
         except Exception as exc:
             log.exception("media information failed")
-            await self.safe_edit(status, f"❌ Media information failed: {type(exc).__name__}: {exc}", buttons=[[Button.inline("⬅️ Back", b"video:back")]])
+            await self.safe_edit(
+                status, f"Media information failed:\n{esc(error_text(exc))}",
+                buttons=[[Button.inline("\u2B05\uFE0F Back", b"video:back")]], parse_mode="html",
+            )
+        finally:
+            self.end_job(uid)
 
     async def run_thumbnail(self, chat_id, uid):
         st = self.state(uid)
         path = self.video_media(st)
-        if not path: await self.client.send_message(chat_id, "❌ Send a video first."); return
+        if not path:
+            await self.client.send_message(chat_id, "Send a video first.")
+            return
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.jpg")
+        self.begin_job(uid, "Extracting thumbnail")
+        status = await self.new_status_message(chat_id, "Extracting thumbnail\u2026", buttons=cancel_menu())
         try:
-            await asyncio.to_thread(ffmpeg.manual_shot, path, out, "00:00:01")
-            await self.client.send_file(chat_id, str(out), caption="🖼️ Thumbnail")
+            async with self.ffmpeg_semaphore:
+                job_token = process_control.set_job(uid)
+                try:
+                    await asyncio.to_thread(ffmpeg.manual_shot, path, out, "00:00:01")
+                finally:
+                    process_control.reset_job(job_token)
+            await self.client.send_file(chat_id, str(out), caption="Thumbnail")
+            st.status_message_id = None
+            st.status_chat_id = None
         except Exception as exc:
-            await self.client.send_message(chat_id, f"❌ Thumbnail failed: {exc}")
-
-    async def run_archive(self, chat_id, uid):
-        st = self.state(uid)
-        if not st.path: await self.client.send_message(chat_id, "❌ Send an archive first."); return
-        outdir = self.cfg.work_dir / str(uid) / "extracted"
-        try:
-            await asyncio.to_thread(extract_archive, st.path, outdir)
-            files = [p for p in outdir.rglob("*") if p.is_file()]
-            st.outputs = files
-            if not files:
-                await self.client.send_message(chat_id, "✅ Archive extracted, but it contained no files."); return
-            preview = "\n".join(f"• {p.relative_to(outdir)} ({format_bytes(p.stat().st_size)})" for p in files[:30])
-            more = f"\n… and {len(files)-30} more" if len(files) > 30 else ""
-            await self.client.send_message(chat_id, f"✅ Extracted {len(files)} file(s).\n\n{preview}{more}\n\nUse /upload to choose a destination for the current output.")
-            if files:
-                st.path = files[0]
-        except Exception as exc:
-            await self.client.send_message(chat_id, f"❌ Extraction failed: {exc}")
+            out.unlink(missing_ok=True)
+            await self.safe_edit(status, f"Thumbnail failed:\n{esc(error_text(exc))}", parse_mode="html")
+        finally:
+            self.end_job(uid)
 
     async def admin_cancel_user(self, chat_id: int, sudo_uid: int, identifier: str):
         if not self.is_sudo(sudo_uid):
             return
         target = self.db.find_user(identifier)
         if target is None:
-            await self.render_ui(chat_id, sudo_uid, f"❌ User <code>{identifier}</code> is not registered.", buttons=admin_menu(), parse_mode="html")
+            await self.render_ui(chat_id, sudo_uid, f"User <code>{esc(identifier)}</code> is not registered.", buttons=admin_menu(), parse_mode="html")
             return
         if target == sudo_uid:
-            await self.render_ui(chat_id, sudo_uid, "❌ You cannot cancel your own admin session from this control.", buttons=admin_menu(), parse_mode="html")
+            await self.render_ui(chat_id, sudo_uid, "You cannot cancel your own admin session from this control.", buttons=admin_menu(), parse_mode="html")
             return
         st = self.state(target)
-        if not st.busy and not st.pending and not st.merge_inputs:
-            await self.render_ui(chat_id, sudo_uid, f"ℹ️ User <code>{target}</code> has no active process.", buttons=admin_menu(), parse_mode="html")
+        if not st.busy and not st.pending and not st.merge_inputs and not st.queue.has_work():
+            await self.render_ui(chat_id, sudo_uid, f"User <code>{target}</code> has no active process.", buttons=admin_menu(), parse_mode="html")
             return
         await self.cancel(target, target, admin=True)
-        await self.render_ui(chat_id, sudo_uid, f"✅ Cancelled job for <code>{target}</code>.", buttons=admin_menu(), parse_mode="html")
+        await self.render_ui(chat_id, sudo_uid, f"Cancelled job for <code>{target}</code>.", buttons=admin_menu(), parse_mode="html")
         try:
             await self.client.send_message(target, "🛑 <b>Your process was cancelled by an administrator.</b>", parse_mode="html")
         except Exception:
             pass
 
     async def admin_broadcast(self, chat_id: int, sudo_uid: int, text: str):
+        """Send a message to every registered user, politely.
+
+        Telegram punishes rapid-fire sends with a flood-wait, so the loop is
+        throttled, honours a server-requested wait and reports progress instead
+        of running silently to completion.
+        """
         if not self.is_sudo(sudo_uid):
             return
         users = self.db.all_users()
+        if not users:
+            await self.render_ui(chat_id, sudo_uid, "No users are registered yet.", buttons=admin_menu(), parse_mode="html")
+            return
+        status = await self.render_ui(
+            chat_id, sudo_uid,
+            f"Broadcasting to {len(users)} users\u2026\n\nSent: 0\nFailed: 0",
+            buttons=admin_menu(), parse_mode="html",
+        )
         sent = failed = 0
-        for target in users:
+        cancelled = False
+        for index, target in enumerate(users, 1):
+            if self.state(sudo_uid).pending_admin_action == "__broadcast_stop__":
+                cancelled = True
+                self.state(sudo_uid).pending_admin_action = None
+                break
             try:
                 await self.client.send_message(target, text, link_preview=False)
                 sent += 1
-            except Exception:
+            except Exception as exc:
                 failed += 1
-        await self.render_ui(chat_id, sudo_uid, f"📢 <b>Broadcast complete</b>\n\nSent: {sent}\nFailed: {failed}\nTotal users: {len(users)}", buttons=admin_menu(), parse_mode="html")
+                wait = getattr(exc, "seconds", None)
+                if wait:
+                    # A flood-wait is not a hard failure: back off and retry.
+                    failed -= 1
+                    with contextlib.suppress(Exception):
+                        await asyncio.sleep(min(60, float(wait)))
+                    try:
+                        await self.client.send_message(target, text, link_preview=False)
+                        sent += 1
+                    except Exception:
+                        failed += 1
+            await asyncio.sleep(0.05)
+            if index % 25 == 0 or index == len(users):
+                await self.safe_edit(
+                    status,
+                    f"Broadcasting\u2026\n\n<b>Total:</b> {len(users)}\n<b>Sent:</b> {sent}\n<b>Failed:</b> {failed}",
+                    parse_mode="html",
+                )
+        state = "stopped" if cancelled else "complete"
+        await self.safe_edit(
+            status,
+            f"Broadcast {state}\n\n<b>Total:</b> {len(users)}\n<b>Sent:</b> {sent}\n<b>Failed:</b> {failed}",
+            buttons=admin_menu(), parse_mode="html",
+        )
 
     async def begin_upload_flow(self, chat_id: int, uid: int, destination: str | None = None):
         # Kept as a compatibility wrapper. Destination is selected first; only
@@ -1581,7 +2188,7 @@ class MediaToolsBot:
         try:
             old.rename(target)
         except OSError as exc:
-            await self.render_ui(chat_id, uid, f"❌ Rename failed: {exc}", buttons=main_menu())
+            await self.render_ui(chat_id, uid, f"Rename failed: {esc(error_text(exc))}", buttons=main_menu(), parse_mode="html")
             return
         st.path = target
         st.original_name = target.name
@@ -1626,7 +2233,7 @@ class MediaToolsBot:
             await self.run_gofile(chat_id, uid)
 
     def _upload_files(self, st: UserState) -> list[Path]:
-        files = [p for p in st.outputs if p and p.exists() and p.is_file()]
+        files = [p for p in st.outputs if p and p.is_file() and p.exists()]
         if not files and st.path and st.path.exists():
             files = [st.path]
         # Avoid duplicate filesystem paths, which was the cause of the old
@@ -1710,247 +2317,403 @@ class MediaToolsBot:
             await reporter.update(offset, total_bytes, f"📤 Uploaded {path.name}")
         return uploaded, base_folder if preserve_tree else folder_id
 
-    async def run_gofile(self, chat_id, uid, label="📤 Uploading to GoFile"):
+    async def run_gofile(self, chat_id, uid, label="Uploading to GoFile"):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first.")
+            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
             return
         files = self._upload_files(st)
         if not files:
-            await self.render_ui(chat_id, uid, "❌ No current file(s) to upload.", buttons=main_menu())
+            await self.render_ui(chat_id, uid, "No current file(s) to upload.", buttons=main_menu())
             return
-        st.cancel_event = asyncio.Event(); st.task = asyncio.current_task()
-        st.operation = "GoFile upload"; st.progress_current = 0; st.progress_total = 0; st.started_at = time.monotonic()
-        total_bytes = sum(p.stat().st_size for p in files)
-        status = await self.new_status_message(chat_id, f"{label}\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total_bytes)}", buttons=cancel_menu(), parse_mode="html")
+        self.begin_job(uid, "GoFile upload")
+        total_bytes = sum(self._safe_size(p) for p in files)
+        status = await self.new_status_message(
+            chat_id,
+            f"{esc(label)}\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total_bytes)}",
+            buttons=cancel_menu(), parse_mode="html",
+        )
         reporter = await self.progress_message(status, uid=uid)
         try:
             async with self.semaphore:
                 uploaded, folder_id = await self._gofile_upload_tree(chat_id, uid, files, reporter, total_bytes, st)
-            lines = ["✅ <b>GoFile upload complete</b>"]
+            lines = ["<b>GoFile upload complete</b>"]
             if st.output_root and len(files) > 1 and folder_id:
-                lines.append(f"📁 <b>Folder:</b> https://gofile.io/d/{folder_id}")
+                lines.append(f"<b>Folder:</b> https://gofile.io/d/{folder_id}")
             else:
                 for path, data in uploaded:
                     link = data.get("downloadPage") or data.get("download_page") or data.get("directLink") or data.get("link")
-                    lines.append(f"• <b>{safe_filename(path.name)}</b> — {format_bytes(path.stat().st_size)}")
-                    if link: lines.append(f"  {link}")
+                    lines.append(f"\u2022 <b>{esc(safe_filename(path.name))}</b> \u2014 {format_bytes(self._safe_size(path))}")
+                    if link:
+                        lines.append(f"  {esc(link)}")
             await self.safe_edit(status, "\n".join(lines), buttons=None, parse_mode="html", link_preview=False)
             await self.stop_timeout(uid)
             self.cleanup_user_files(uid)
-            st.path = st.source_path = st.root_path = None; st.outputs.clear(); st.streams.clear(); st.merge_inputs.clear(); st.output_root = None
-            st.pending = None; st.operation = None; st.progress_current = st.progress_total = 0
+            self._reset_session(st)
         except asyncio.CancelledError:
             await self.cancelled_status(uid, status)
             self.cleanup_user_files(uid)
         except Exception as exc:
             log.exception("GoFile upload failed")
-            await self.safe_edit(status, f"❌ GoFile upload failed:\n{type(exc).__name__}: {exc}", buttons=None)
+            await self.safe_edit(status, f"GoFile upload failed:\n{esc(error_text(exc))}", buttons=None, parse_mode="html")
         finally:
-            self._clear_busy(uid); st.operation = None; st.progress_current = st.progress_total = 0
+            self.end_job(uid)
 
     async def upload_telegram(self, chat_id, uid):
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first."); return
+            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
+            return
         files = self._upload_files(st)
         if not files:
-            await self.render_ui(chat_id, uid, "❌ No current file.", buttons=main_menu()); return
-        st.cancel_event = asyncio.Event(); st.task = asyncio.current_task()
-        st.operation = "Telegram upload"; st.progress_current = 0; st.progress_total = 0; st.started_at = time.monotonic()
-        status = await self.new_status_message(chat_id, "📤 Uploading to Telegram using MTProto...", buttons=cancel_menu())
+            await self.render_ui(chat_id, uid, "No current file.", buttons=main_menu())
+            return
+        self.begin_job(uid, "Telegram upload")
+        status = await self.new_status_message(chat_id, "Uploading to Telegram using MTProto\u2026", buttons=cancel_menu())
         reporter = await self.progress_message(status, uid=uid)
+        chunk_dir = self.cfg.work_dir / str(uid) / "telegram_chunks"
         try:
             telegram_mode = self.db.get_telegram_mode(uid)
             thumb = self.db.get_thumbnail(uid)
-            sent_items = []
-            total = sum(p.stat().st_size for p in files)
+            total = sum(self._safe_size(p) for p in files)
             done = 0
+            skipped = 0
             async with self.semaphore:
                 for path in files:
-                    chunks = chunk_file(path, self.cfg.work_dir / str(uid) / "telegram_chunks")
-                    for idx, item in enumerate(chunks, 1):
-                        item_size = item.stat().st_size
-                        async def cb(cur, file_total, *, base=done):
-                            if st.cancel_event.is_set(): raise asyncio.CancelledError
-                            await reporter.update(base + int(cur), total, f"📤 Uploading {item.name}")
-                        await self.client.send_file(
-                            chat_id, str(item), caption=(path.name if len(chunks) == 1 else f"{path.name} — part {idx}/{len(chunks)}"),
-                            force_document=(telegram_mode == "document" or len(chunks) > 1),
-                            thumb=thumb if thumb and Path(thumb).exists() and len(chunks) == 1 else None,
-                            progress_callback=cb,
-                        )
-                        done += item_size
-                        await reporter.update(done, total, f"📤 Uploaded {item.name}")
-                    if len(chunks) > 1:
-                        for c in chunks: c.unlink(missing_ok=True)
-            await self.safe_edit(status, f"✅ <b>Telegram upload complete</b>\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total)}", buttons=None, parse_mode="html")
+                    if st.cancel_event.is_set():
+                        raise asyncio.CancelledError
+                    if not path.exists():
+                        skipped += 1
+                        continue
+                    chunks = chunk_file(path, chunk_dir)
+                    try:
+                        for idx, item in enumerate(chunks, 1):
+                            if st.cancel_event.is_set():
+                                raise asyncio.CancelledError
+                            item_size = self._safe_size(item)
+                            caption = path.name if len(chunks) == 1 else f"{path.name} \u2014 part {idx}/{len(chunks)}"
+
+                            async def cb(cur, file_total, *, base=done, label=item.name):
+                                if st.cancel_event.is_set():
+                                    raise asyncio.CancelledError
+                                await reporter.update(base + int(cur), total, f"Uploading {label}")
+
+                            await self.client.send_file(
+                                chat_id, str(item), caption=caption,
+                                force_document=(telegram_mode == "document" or len(chunks) > 1),
+                                thumb=thumb if thumb and Path(thumb).exists() and len(chunks) == 1 else None,
+                                progress_callback=cb,
+                            )
+                            done += item_size
+                            await reporter.update(done, total, f"Uploaded {item.name}")
+                    finally:
+                        if len(chunks) > 1:
+                            for c in chunks:
+                                c.unlink(missing_ok=True)
+            summary = f"<b>Telegram upload complete</b>\n<b>Files:</b> {len(files) - skipped}\n<b>Total:</b> {format_bytes(total)}"
+            if skipped:
+                summary += f"\n<i>{skipped} file(s) were no longer available and were skipped.</i>"
+            await self.safe_edit(status, summary, buttons=None, parse_mode="html")
             await self.stop_timeout(uid)
             self.cleanup_user_files(uid)
-            st.path = st.source_path = st.root_path = None; st.outputs.clear(); st.streams.clear(); st.merge_inputs.clear(); st.output_root = None
-            st.pending = None
+            self._reset_session(st)
         except asyncio.CancelledError:
-            await self.cancelled_status(uid, status); self.cleanup_user_files(uid)
+            await self.cancelled_status(uid, status)
+            self.cleanup_user_files(uid)
         except Exception as exc:
             log.exception("Telegram MTProto upload failed")
-            await self.safe_edit(status, f"❌ Telegram MTProto upload failed:\n{type(exc).__name__}: {exc}", buttons=None)
+            await self.safe_edit(status, f"Telegram upload failed:\n{esc(error_text(exc))}", buttons=None, parse_mode="html")
         finally:
-            self._clear_busy(uid); st.operation = None; st.progress_current = st.progress_total = 0
+            self.end_job(uid)
 
-    async def execute(self, chat_id, uid, label, func, upload=False, set_source=True):
+    @staticmethod
+    def _safe_size(path: Path) -> int:
+        try:
+            return path.stat().st_size
+        except OSError:
+            return 0
+
+    @staticmethod
+    def _reset_session(st: UserState) -> None:
+        """Clear the working set after a successful delivery."""
+        st.path = st.source_path = st.root_path = None
+        st.outputs.clear()
+        st.streams.clear()
+        st.merge_inputs.clear()
+        st.output_root = None
+        st.queue.drop_finished()
+        st.pending = None
+        st.view = "menu"
+
+    async def execute(self, chat_id, uid, label, func, upload=False, set_source=True, ffmpeg=True):
+        """Run a blocking media job in a thread with live progress.
+
+        FFmpeg work is additionally capped by a dedicated semaphore so a burst
+        of users cannot start more transcodes than the host can survive.
+        """
         st = self.state(uid)
         if st.busy:
-            await self.client.send_message(chat_id, "⚠️ A process is already running. Press Cancel first."); return
-        st.cancel_event = asyncio.Event(); st.task = asyncio.current_task()
-        st.operation = label; st.progress_current = 0; st.progress_total = 0; st.started_at = time.monotonic()
-        status = await self.new_status_message(chat_id, label + "...", buttons=cancel_menu())
+            await self.client.send_message(chat_id, "A process is already running. Press Cancel first.")
+            return
+        status = await self.new_status_message(chat_id, label + "…", buttons=cancel_menu())
+        reporter = await self.progress_message(status, uid=uid, operation=label)
+        self.begin_job(uid, label)
+        guard = self.ffmpeg_semaphore if ffmpeg else self.semaphore
+        stop = asyncio.Event()
+        flusher = asyncio.create_task(self._flush_ffmpeg_progress(reporter, label, stop))
         try:
-            async with self.semaphore:
+            async with guard:
                 job_token = process_control.set_job(uid)
                 try:
-                    out = await asyncio.to_thread(func)
+                    out = await asyncio.to_thread(func, reporter)
                 finally:
                     process_control.reset_job(job_token)
-            if st.cancel_event.is_set(): raise asyncio.CancelledError
+            if st.cancel_event.is_set():
+                raise asyncio.CancelledError
             st.path = Path(out)
+            if not st.path.exists():
+                raise RuntimeError("FFmpeg reported success but produced no file")
             st.original_name = st.path.name
             st.outputs = [st.path]
             if set_source:
                 st.source_path = st.path
                 st.root_path = st.path
-            st.streams = ffprobe.probe(st.path).get("streams", [])
-            await self.safe_edit(status, "✅ Processing complete", buttons=None)
+            # Probing can take seconds on a large file; keep it off the event
+            # loop and never let a probe failure fail a successful job.
+            st.streams = (await asyncio.to_thread(ffprobe.safe_probe, st.path)).get("streams", [])
+            await self.safe_edit(status, "Processing complete", buttons=None)
             if upload:
                 await self.clear_status_message(uid, delete=True)
                 st.task = None
                 st.operation = None
                 st.progress_current = st.progress_total = 0
+                st.queue.paused = False
                 await self.choose_upload(chat_id, uid)
         except asyncio.CancelledError:
             await self.cancelled_status(uid, status)
             self.cleanup_user_files(uid)
+        except subprocess.TimeoutExpired:
+            log.warning("job timed out for user %s: %s", uid, label)
+            await self.safe_edit(status, "The job took too long and was stopped. Please try a smaller file.", buttons=[[Button.inline("Home", b"start:home")]])
+            self.cleanup_user_files(uid)
         except Exception as exc:
             log.exception("media job failed")
-            await self.safe_edit(status, f"❌ {label} failed:\n{type(exc).__name__}: {exc}")
+            await self.safe_edit(status, f"{esc(label)} failed:\n{esc(error_text(exc))}", parse_mode="html")
             self.cleanup_user_files(uid)
         finally:
-            self._clear_busy(uid)
-            if not upload:
-                st.operation = None
-                st.progress_current = st.progress_total = 0
+            stop.set()
+            flusher.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await flusher
+            self.end_job(uid)
 
     async def run_media_job(self, chat_id, uid, operation):
         st = self.state(uid)
         path = self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "❌ This operation requires a video file."); return
+            await self.client.send_message(chat_id, "This operation requires a video file.")
+            return
         suffix = {"mp4": ".mp4", "toaudio": ".mp3"}.get(operation, ".mkv")
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.{operation}{suffix}")
         fn = {
-            "remove_audio": lambda: ffmpeg.remove_audio(path, out),
-            "optimize": lambda: ffmpeg.optimize(path, out),
-            "mp4": lambda: ffmpeg.convert_video(path, out, "mp4"),
-            "mkv": lambda: ffmpeg.convert_video(path, out, "mkv"),
-            "toaudio": lambda: ffmpeg.video_to_audio(path, out),
+            "remove_audio": lambda cb: ffmpeg.remove_audio(path, out, on_progress=cb),
+            "optimize": lambda cb: ffmpeg.optimize(path, out, on_progress=cb),
+            "mp4": lambda cb: ffmpeg.convert_video(path, out, "mp4", on_progress=cb),
+            "mkv": lambda cb: ffmpeg.convert_video(path, out, "mkv", on_progress=cb),
+            "toaudio": lambda cb: ffmpeg.video_to_audio(path, out, on_progress=cb),
         }[operation]
-        await self.execute(chat_id, uid, f"🎬 {operation.replace('_',' ').title()}", fn, upload=True)
+        label = f"\U0001F3AC {operation.replace('_', ' ').title()}"
+        await self.execute(chat_id, uid, label, self.make_ffmpeg_job(uid, fn, path), upload=True)
 
     async def run_audio_convert(self, chat_id, uid, codec, ext):
         st = self.state(uid)
-        if not st.path: await self.client.send_message(chat_id, "❌ Send audio/video first."); return
+        if not st.path or not st.path.exists():
+            await self.client.send_message(chat_id, "Send audio or video first.")
+            return
         out = unique_path(self.cfg.work_dir / str(uid), f"{st.path.stem}.converted{ext}")
-        await self.execute(chat_id, uid, "🎵 Converting audio", lambda: ffmpeg.audio_convert(st.path, out, codec), upload=True)
+        fn = lambda cb: ffmpeg.audio_convert(st.path, out, codec, on_progress=cb)  # noqa: E731
+        await self.execute(chat_id, uid, "\U0001F3B5 Converting audio", self.make_ffmpeg_job(uid, fn, st.path), upload=True)
 
     async def run_audio_filter(self, chat_id, uid, filt, name):
         st = self.state(uid)
-        if not st.path: await self.client.send_message(chat_id, "❌ Send audio/video first."); return
+        if not st.path or not st.path.exists():
+            await self.client.send_message(chat_id, "Send audio or video first.")
+            return
         out = unique_path(self.cfg.work_dir / str(uid), f"{st.path.stem}.{safe_filename(name)}.m4a")
-        await self.execute(chat_id, uid, f"🎵 Applying {name}", lambda: ffmpeg.audio_filter(st.path, out, filt), upload=True)
+        fn = lambda cb: ffmpeg.audio_filter(st.path, out, filt, on_progress=cb)  # noqa: E731
+        await self.execute(chat_id, uid, f"\U0001F3B5 Applying {esc(name)}", self.make_ffmpeg_job(uid, fn, st.path), upload=True)
 
     async def run_trim(self, chat_id, uid, text, audio=False):
-        st = self.state(uid); st.pending = None
+        st = self.state(uid)
+        st.pending = None
         parts = text.split()
         if len(parts) not in (1, 2) or not st.path:
-            await self.client.send_message(chat_id, "❌ Use `start end`."); return
+            await self.client.send_message(chat_id, "Use: start end (for example 00:05 00:30)")
+            return
         end = parts[1] if len(parts) == 2 else None
         path = st.path if audio else self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "❌ No suitable media stream found."); return
+            await self.client.send_message(chat_id, "No suitable media stream was found.")
+            return
         ext = path.suffix or ".mkv"
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.trim{ext}")
-        await self.execute(chat_id, uid, "✂️ Trimming audio" if audio else "✂️ Trimming video", lambda: ffmpeg.trim(path, out, parts[0], end), upload=True)
+        fn = lambda cb: ffmpeg.trim(path, out, parts[0], end, on_progress=cb)  # noqa: E731
+        label = "Trimming audio" if audio else "Trimming video"
+        await self.execute(chat_id, uid, label, self.make_ffmpeg_job(uid, fn, path), upload=True)
 
     async def run_manual_shot(self, chat_id, uid, text):
-        st = self.state(uid); st.pending = None
+        st = self.state(uid)
+        st.pending = None
         path = self.video_media(st)
         if not path:
-            await self.render_ui(chat_id, uid, "❌ Screenshot requires a video file.", buttons=video_menu())
+            await self.render_ui(chat_id, uid, "Screenshots require a video file.", buttons=video_menu())
             return
         timestamps = [x.strip() for x in re.split(r"[,\n]+", text) if x.strip()]
         if not 1 <= len(timestamps) <= 20:
-            await self.render_ui(chat_id, uid, "❌ Provide between 1 and 20 timestamps.", buttons=video_menu())
+            await self.render_ui(chat_id, uid, "Provide between 1 and 20 timestamps.", buttons=video_menu())
             return
+        for timestamp in timestamps:
+            try:
+                ffmpeg.parse_timecode(timestamp)
+            except ValueError:
+                await self.render_ui(chat_id, uid, f"Invalid timestamp: {esc(timestamp)}", buttons=video_menu(), parse_mode="html")
+                return
         outdir = self.cfg.work_dir / str(uid) / "manual_shots"
         outdir.mkdir(parents=True, exist_ok=True)
         shots = []
+        self.begin_job(uid, "Capturing frames")
+        status = await self.new_status_message(chat_id, "Capturing frames…", buttons=cancel_menu())
         try:
             for i, timestamp in enumerate(timestamps, 1):
+                if st.cancel_event.is_set():
+                    raise asyncio.CancelledError
                 out = unique_path(outdir, f"{path.stem}.shot_{i:02d}.jpg")
                 await asyncio.to_thread(ffmpeg.manual_shot, path, out, timestamp)
                 shots.append(out)
-            await self.client.send_file(chat_id, [str(p) for p in shots], caption=f"🖼️ Manual Shots — {len(shots)}")
-            await self.send_main(chat_id, uid)
+                await self.safe_edit(status, f"Captured {i}/{len(timestamps)} frames…", parse_mode="html")
+            await self.client.send_file(chat_id, [str(p) for p in shots], caption=f"Manual Shots ({len(shots)})")
+            st.status_message_id = None
+            st.status_chat_id = None
+            await self.show_file_menu(chat_id, uid, st.path)
+        except asyncio.CancelledError:
+            for shot in shots:
+                shot.unlink(missing_ok=True)
+            await self.cancelled_status(uid, status)
         except Exception as exc:
-            await self.render_ui(chat_id, uid, f"❌ Manual screenshot failed: {exc}", buttons=video_menu())
+            for shot in shots:
+                shot.unlink(missing_ok=True)
+            await self.safe_edit(status, f"Screenshot failed:\n{esc(error_text(exc))}", parse_mode="html")
+        finally:
+            self.end_job(uid)
 
     async def run_split(self, chat_id, uid, text):
-        st = self.state(uid); st.pending = None
-        if not st.path: return
-        try: seconds = int(text)
-        except ValueError:
-            await self.client.send_message(chat_id, "❌ Enter an integer number of seconds."); return
-        if seconds < 1:
-            await self.client.send_message(chat_id, "❌ Segment length must be at least 1 second."); return
-        outdir = self.cfg.work_dir / str(uid) / "split"
+        st = self.state(uid)
+        st.pending = None
+        path = self.video_media(st)
+        if not path:
+            await self.client.send_message(chat_id, "Splitting requires a video file.")
+            return
         try:
-            parts = await asyncio.to_thread(ffmpeg.split_video, st.path, outdir, seconds)
+            seconds = int(str(text).strip())
+        except ValueError:
+            await self.client.send_message(chat_id, "Enter a whole number of seconds.")
+            return
+        if seconds < 1:
+            await self.client.send_message(chat_id, "Segment length must be at least 1 second.")
+            return
+        outdir = self.cfg.work_dir / str(uid) / "split"
+        self.begin_job(uid, "Splitting video")
+        status = await self.new_status_message(chat_id, "Splitting video…", buttons=cancel_menu())
+        try:
+            job_token = process_control.set_job(uid)
+            try:
+                async with self.ffmpeg_semaphore:
+                    parts = await asyncio.to_thread(ffmpeg.split_video, path, outdir, seconds)
+            finally:
+                process_control.reset_job(job_token)
+            if st.cancel_event.is_set():
+                raise asyncio.CancelledError
             st.outputs = parts
-            if parts: st.path = parts[0]
-            preview = "\n".join(f"• {p.name} ({format_bytes(p.stat().st_size)})" for p in parts[:20])
-            await self.client.send_message(chat_id, f"✅ Created {len(parts)} segment(s).\n\n{preview}\n\nUse /upload telegram or /upload gofile for the selected first part.")
+            if parts:
+                st.path = parts[0]
+            st.source_path = path
+            st.root_path = path
+            st.output_root = outdir
+            rows = "\n".join(
+                f"\u2022 <code>{esc(p.name)}</code> ({format_bytes(p.stat().st_size)})" for p in parts[:20]
+            )
+            more = f"\n\u2026 and {len(parts) - 20} more" if len(parts) > 20 else ""
+            text_out = (
+                f"Created {len(parts)} segment(s).\n\n{rows}{more}\n\n"
+                "Use Upload to send them to Telegram or GoFile."
+            )
+            await self.safe_edit(status, text_out, buttons=upload_menu(), parse_mode="html")
+            st.status_message_id = None
+            st.status_chat_id = None
+            st.view = "menu"
+        except asyncio.CancelledError:
+            await self.cancelled_status(uid, status)
+            self.cleanup_user_files(uid)
         except Exception as exc:
-            await self.client.send_message(chat_id, f"❌ Split failed: {exc}")
+            await self.safe_edit(status, f"Split failed:\n{esc(error_text(exc))}", parse_mode="html")
+        finally:
+            self.end_job(uid)
 
     async def run_sample(self, chat_id, uid, text):
-        st = self.state(uid); st.pending = None
+        st = self.state(uid)
+        st.pending = None
         path = self.video_media(st)
         if not path:
-            await self.client.send_message(chat_id, "❌ Generate Sample requires a video file. Your current selection is not a video.")
+            await self.client.send_message(chat_id, "Generate Sample requires a video file. The current selection is not a video.")
             return
-        try: seconds = int(text or "30")
-        except ValueError: seconds = 30
+        try:
+            seconds = int(str(text).strip() or "30")
+        except ValueError:
+            seconds = 30
         out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.sample.mkv")
-        await self.execute(chat_id, uid, "🎥 Generating sample", lambda: ffmpeg.sample(path, out, seconds), upload=True)
+        fn = lambda cb: ffmpeg.sample(path, out, seconds, on_progress=cb)  # noqa: E731
+        await self.execute(chat_id, uid, "Generating sample", self.make_ffmpeg_job(uid, fn, path), upload=True)
 
     async def run_shots(self, chat_id, uid, text):
-        st = self.state(uid); st.pending = None
+        st = self.state(uid)
+        st.pending = None
         path = self.video_media(st)
         if not path:
-            await self.render_ui(chat_id, uid, "❌ Screenshot generation requires a video file.", buttons=video_menu())
+            await self.render_ui(chat_id, uid, "Screenshot generation requires a video file.", buttons=video_menu())
             return
         try:
             count = int(text.strip())
             if not 1 <= count <= 20:
                 raise ValueError
         except ValueError:
-            await self.render_ui(chat_id, uid, "❌ Screenshot count must be a number from 1 to 20.", buttons=video_menu())
+            await self.render_ui(chat_id, uid, "Screenshot count must be a number from 1 to 20.", buttons=video_menu())
             return
+        self.begin_job(uid, "Extracting screenshots")
+        status = await self.new_status_message(chat_id, "Extracting screenshots…", buttons=cancel_menu())
+        shots: list[Path] = []
         try:
-            shots = await asyncio.to_thread(ffmpeg.screenshots, path, self.cfg.work_dir / str(uid) / "shots", count)
-            await self.client.send_file(chat_id, [str(p) for p in shots], caption=f"🖼️ Screenshots — {len(shots)}")
-            await self.send_main(chat_id, uid)
+            async with self.ffmpeg_semaphore:
+                job_token = process_control.set_job(uid)
+                try:
+                    shots = await asyncio.to_thread(ffmpeg.screenshots, path, self.cfg.work_dir / str(uid) / "shots", count)
+                finally:
+                    process_control.reset_job(job_token)
+            if st.cancel_event.is_set():
+                raise asyncio.CancelledError
+            await self.client.send_file(chat_id, [str(p) for p in shots], caption=f"Screenshots ({len(shots)})")
+            st.status_message_id = None
+            st.status_chat_id = None
+            await self.show_file_menu(chat_id, uid, st.path)
+        except asyncio.CancelledError:
+            for shot in shots:
+                shot.unlink(missing_ok=True)
+            await self.cancelled_status(uid, status)
         except Exception as exc:
-            await self.render_ui(chat_id, uid, f"❌ Screenshot generation failed: {exc}", buttons=video_menu())
+            for shot in shots:
+                shot.unlink(missing_ok=True)
+            await self.safe_edit(status, f"Screenshot generation failed:\n{esc(error_text(exc))}", parse_mode="html")
+        finally:
+            self.end_job(uid)
 
     async def cancel(self, uid, chat_id, source_message=None, admin: bool = False):
         st = self.state(uid)
@@ -1963,6 +2726,9 @@ class MediaToolsBot:
         st.merge_inputs.clear()
         st.archive_parts.clear()
         st.archive_series = st.archive_password = st.archive_mode = None
+        # Stop background downloads too, otherwise a cancelled session keeps
+        # pulling gigabytes the user no longer wants.
+        self.cancel_downloads(uid)
         # Cancel the owning coroutine so network waits stop immediately. FFmpeg
         # workers are also guarded by cleanup; no user file is deleted here.
         if was_busy and st.task is not asyncio.current_task():
@@ -1973,19 +2739,23 @@ class MediaToolsBot:
                 pass
         # Remove the active progress message/keyboard and immediately remove
         # temporary server files. Valid direct-link files are protected by DB
-        # expiry and therefore survive until their 24-hour link expires.
+        # expiry and therefore survive until their link expires.
         await self.clear_status_message(uid, delete=True)
         await self.stop_timeout(uid)
-        self.cleanup_user_files(uid)
-        # Return the existing UI message to the start screen. This removes all
-        # operation menus while keeping exactly one stable start menu.
-        try:
-            await self.send_start_info(chat_id, uid)
-        except Exception:
-            await self.send_start_info(chat_id, uid)
+        self.cleanup_user_files(uid, force=True)
+        st.path = st.source_path = st.root_path = None
+        st.outputs.clear()
+        st.streams.clear()
+        st.output_root = None
+        st.view = "start"
         st.operation = None
         st.progress_current = st.progress_total = 0
         st.started_at = None
+        st.task = None
+        # Return the existing UI message to the start screen. This removes all
+        # operation menus while keeping exactly one stable start menu.
+        with contextlib.suppress(Exception):
+            await self.send_start_info(chat_id, uid, source=source_message)
 
     async def _direct_cleanup_loop(self):
         try:
@@ -2006,6 +2776,21 @@ class MediaToolsBot:
         except asyncio.CancelledError:
             return
 
+    def _content_disposition(self, name: str, inline: bool) -> str:
+        """Build a valid Content-Disposition for arbitrary file names.
+
+        Non-ASCII names must use RFC 6266's ``filename*`` form; putting raw
+        UTF-8 in ``filename`` makes some browsers mangle or reject the header.
+        """
+        disposition = "inline" if inline else "attachment"
+        try:
+            name.encode("ascii")
+        except UnicodeEncodeError:
+            from urllib.parse import quote as _quote
+            ascii_name = safe_filename(name.encode("ascii", "ignore").decode() or "file")
+            return f"{disposition}; filename=\"{ascii_name}\"; filename*=UTF-8''{_quote(name)}"
+        return f'{disposition}; filename="{name}"'
+
     async def start_web_server(self):
         app = web.Application(client_max_size=0)
 
@@ -2022,10 +2807,29 @@ class MediaToolsBot:
             allowed_roots = [self.cfg.download_dir.resolve(), self.cfg.work_dir.resolve()]
             if not path.is_file() or not any(path == root or root in path.parents for root in allowed_roots):
                 raise web.HTTPNotFound(text="File not found")
-            return web.FileResponse(path, headers={"Content-Disposition": f'inline; filename="{safe_filename(path.name)}"'})
+            filename = safe_filename(request.match_info.get("filename") or path.name)
+            disposition = self._content_disposition(filename, inline=True)
+            if request.query.get("download") is not None:
+                disposition = self._content_disposition(filename, inline=False)
+            return web.FileResponse(
+                path,
+                headers={
+                    "Content-Disposition": disposition,
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
+
+        async def index(request):
+            return web.Response(text="Media Tools Bot direct-link server", content_type="text/plain")
 
         app.router.add_get("/f/{token}/{filename}", serve, allow_head=True)
-        app.router.add_get("/health", lambda request: web.json_response({"ok": True, "transport": "mtproto"}))
+        app.router.add_get("/", index)
+        app.router.add_get("/health", lambda request: web.json_response({
+            "ok": True,
+            "transport": "mtproto",
+            "ffmpeg": bool(shutil.which("ffmpeg")),
+            "active_jobs": process_control.active_job_count(),
+        }))
         self.web_runner = web.AppRunner(app)
         await self.web_runner.setup()
         site = web.TCPSite(self.web_runner, self.cfg.web_host, self.cfg.web_port)
@@ -2037,20 +2841,64 @@ class MediaToolsBot:
             await self.web_runner.cleanup()
             self.web_runner = None
 
+    async def _sweep_orphans(self) -> None:
+        """Remove leftover files from a previous run at start-up.
+
+        A crash or a hard container restart leaves whole download/work
+        directories behind. Nothing references them any more, so they are
+        deleted once on boot instead of slowly filling the disk.
+        """
+        try:
+            if not self.cfg.download_dir.exists():
+                return
+            known_users = set(self.db.all_users())
+            removed = 0
+            for entry in self.cfg.download_dir.iterdir():
+                if not entry.is_dir():
+                    continue
+                if not entry.name.isdigit():
+                    continue
+                if int(entry.name) in known_users and self.state(int(entry.name)).queue.has_work():
+                    continue
+                shutil.rmtree(entry, ignore_errors=True)
+                removed += 1
+            if removed:
+                log.info("removed %d orphaned download director%s", removed, "y" if removed == 1 else "ies")
+        except Exception:
+            log.exception("orphan sweep failed")
+
     async def run(self):
         await self.start_web_server()
         self.direct_cleanup_task = asyncio.create_task(self._direct_cleanup_loop())
+        await asyncio.to_thread(self._sweep_orphans)
         await self.client.start(bot_token=self.cfg.bot_token)
         me = await self.client.get_me()
         log.info("Bot started via Telegram MTProto: @%s id=%s", me.username, me.id)
         log.info("Transport: MTProto only; HTTP Bot API/Local Bot API is NOT used")
         log.info("FFmpeg=%s FFprobe=%s cryptg=%s", shutil.which("ffmpeg"), shutil.which("ffprobe"), self._cryptg_status())
+        log.info(
+            "Limits: jobs=%s ffmpeg=%s parallel_downloads=%s max_download=%sMiB",
+            self.cfg.max_concurrent_jobs, self.cfg.max_ffmpeg_jobs,
+            self.cfg.max_parallel_downloads, self.cfg.max_download_mb,
+        )
         try:
             await self.client.run_until_disconnected()
         finally:
-            if self.direct_cleanup_task:
-                self.direct_cleanup_task.cancel()
-            await self.stop_web_server()
+            await self.shutdown()
+
+    async def shutdown(self) -> None:
+        """Stop background work and release resources cleanly."""
+        log.info("shutting down")
+        for task in (self.direct_cleanup_task, self.sweeper_task):
+            if task and not task.done():
+                task.cancel()
+        for uid, st in list(self.states.items()):
+            st.cancel_event.set()
+            with contextlib.suppress(Exception):
+                self.cancel_downloads(uid)
+        await self.stop_web_server()
+        with contextlib.suppress(Exception):
+            self.db.close()
 
     @staticmethod
     def _cryptg_status() -> str:

@@ -117,7 +117,7 @@ def test_gofile_payload_reuses_folder_id(tmp_path, monkeypatch):
 def test_gofile_batch_and_human_info_contracts():
     source = Path("app/main.py").read_text()
     assert "files = [p for p in st.outputs" in source
-    assert "total_bytes = sum(p.stat().st_size for p in files)" in source
+    assert "total_bytes = sum(self._safe_size(p) for p in files)" in source
     assert "folder_id = self.db.get_gofile_folder(uid)" in source
     assert "self.db.set_gofile_folder(uid, folder_id)" in source
     assert "Open detailed Media Information" in source

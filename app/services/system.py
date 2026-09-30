@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 import platform
 import shutil
-import time
+import tempfile
 from html import escape
+from pathlib import Path
 
 
 def _meminfo() -> tuple[int, int]:
@@ -45,15 +46,24 @@ def _uptime() -> str:
 def system_stats_text(cfg, state) -> str:
     total, available = _meminfo()
     used = max(0, total - available)
-    disk = shutil.disk_usage(cfg.download_dir)
+    try:
+        disk = shutil.disk_usage(cfg.download_dir)
+    except OSError:
+        disk = shutil.disk_usage(Path(tempfile.gettempdir()))
     try:
         load = os.getloadavg()
         load_text = ' / '.join(f'{x:.2f}' for x in load)
-    except Exception:
+    except (OSError, AttributeError):
         load_text = 'unavailable'
     cpu = os.cpu_count() or 1
     ram_pct = (used / total * 100) if total else 0
     disk_pct = (disk.used / disk.total * 100) if disk.total else 0
+    queue = getattr(state, "queue", None)
+    if queue is not None:
+        queued, ready, running, failed = queue.summary()
+        queue_text = f'{queued} queued / {ready} ready / {running} downloading' + (f' / {failed} failed' if failed else '')
+    else:
+        queue_text = 'unavailable'
     return (
         '<b>🖥️ Host System Statistics</b>\n\n'
         f'<b>OS:</b> {escape(platform.platform())}\n'
@@ -67,5 +77,6 @@ def system_stats_text(cfg, state) -> str:
         f'<b>Uptime:</b> {_uptime()}\n\n'
         f'<b>Bot process:</b> {"Running job" if state.busy else "Idle"}\n'
         f'<b>Current file:</b> {escape(state.path.name) if state.path else "None"}\n'
+        f'<b>Download queue:</b> {escape(queue_text)}\n'
         f'<b>Merge queue:</b> {len(state.merge_inputs)}'
     )

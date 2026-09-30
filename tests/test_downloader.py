@@ -21,7 +21,7 @@ def test_downloader_cleans_partial_file_on_cancel(tmp_path):
         await site.start()
         port = site._server.sockets[0].getsockname()[1]
         cancel = asyncio.Event()
-        task = asyncio.create_task(download_url(f"http://127.0.0.1:{port}/file.bin", tmp_path, cancel_event=cancel))
+        task = asyncio.create_task(download_url(f"http://127.0.0.1:{port}/file.bin", tmp_path, cancel_event=cancel, allow_private=True))
         await asyncio.sleep(0.2)
         cancel.set()
         try:

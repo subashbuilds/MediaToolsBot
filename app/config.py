@@ -7,13 +7,70 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# 2 GiB of RAM per concurrent FFmpeg job is a conservative rule of thumb for
+# 1080p transcodes. The FFmpeg semaphore is sized from the container limit when
+# /sys/fs/cgroup is readable so a small VPS does not get OOM-killed.
+DEFAULT_FFMPEG_JOBS = 2
+DEFAULT_MAX_DOWNLOAD_MB = 2048
+
 
 def _int(name: str, default: int) -> int:
-    value = os.getenv(name, str(default)).strip()
+    """Parse an integer env var, falling back to the default when unusable.
+
+    A malformed value must never take the whole bot down at start-up; the
+    operator gets the default and a log-friendly fallback instead.
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
     try:
-        return int(value)
-    except ValueError:
-        raise RuntimeError(f"{name} must be an integer")
+        return int(float(raw.strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def _float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _str_ids(name: str) -> frozenset[int]:
+    """Parse a comma separated list of numeric ids, skipping bad entries."""
+    result: set[int] = set()
+    for item in (os.getenv(name, "") or "").replace(";", ",").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError:
+            continue
+    return frozenset(result)
+
+
+def _mem_based_ffmpeg_jobs(requested: int) -> int:
+    """Clamp the FFmpeg worker count to what the container can actually hold."""
+    try:
+        raw = Path("/sys/fs/cgroup/memory.max").read_text().strip()
+        limit = int(raw) if raw != "max" else 0
+    except (OSError, ValueError):
+        try:
+            raw = Path("/proc/meminfo").read_text()
+            for line in raw.splitlines():
+                if line.startswith("MemTotal:"):
+                    limit = int(line.split()[1]) * 1024
+                    break
+        except (OSError, ValueError, IndexError):
+            limit = 0
+    if limit <= 0:
+        return max(1, requested)
+    affordable = max(1, int(limit / (2 * 1024**3)))
+    return max(1, min(requested, affordable))
 
 
 def _detect_public_base_url() -> str | None:
@@ -52,14 +109,20 @@ class Config:
     work_dir: Path
     db_path: Path
     max_concurrent_jobs: int
+    max_ffmpeg_jobs: int
+    max_download_mb: int
+    max_parallel_downloads: int
     progress_interval: float
     sudo_users: frozenset[int]
+    allowed_users: frozenset[int]
     public_base_url: str | None
     web_host: str
     web_port: int
     direct_link_ttl: int
     telegraph_access_token: str | None
     session_timeout: int
+    reactions_enabled: bool
+    log_level: str = "INFO"
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -68,11 +131,7 @@ class Config:
         bot_token = os.getenv("BOT_TOKEN", "").strip()
         if not api_id or not api_hash or not bot_token:
             raise RuntimeError("API_ID, API_HASH and BOT_TOKEN are required")
-        sudo = set()
-        for item in os.getenv("SUDO_USERS", "").split(","):
-            item = item.strip()
-            if item:
-                sudo.add(int(item))
+        ffmpeg_jobs = _mem_based_ffmpeg_jobs(max(1, _int("MAX_CONCURRENT_FFMPEG_JOBS", DEFAULT_FFMPEG_JOBS)))
         cfg = cls(
             api_id=api_id,
             api_hash=api_hash,
@@ -82,14 +141,20 @@ class Config:
             work_dir=Path(os.getenv("WORK_DIR", "/data/work")),
             db_path=Path(os.getenv("DB_PATH", "/data/bot.sqlite3")),
             max_concurrent_jobs=max(1, _int("MAX_CONCURRENT_JOBS", 10)),
-            progress_interval=max(1.0, float(os.getenv("PROGRESS_INTERVAL", "3"))),
-            sudo_users=frozenset(sudo),
+            max_ffmpeg_jobs=ffmpeg_jobs,
+            max_download_mb=max(1, _int("MAX_DOWNLOAD_MB", DEFAULT_MAX_DOWNLOAD_MB)),
+            max_parallel_downloads=max(1, min(8, _int("MAX_PARALLEL_DOWNLOADS", 3))),
+            progress_interval=max(1.0, _float("PROGRESS_INTERVAL", 3)),
+            sudo_users=_str_ids("SUDO_USERS"),
+            allowed_users=_str_ids("ALLOWED_USERS"),
             public_base_url=_detect_public_base_url(),
             web_host=os.getenv("WEB_HOST", "0.0.0.0").strip(),
             web_port=_int("WEB_PORT", _int("PORT", 8080)),
             direct_link_ttl=max(300, _int("DIRECT_LINK_TTL", 86400)),
             telegraph_access_token=os.getenv("TELEGRAPH_ACCESS_TOKEN", "").strip() or None,
             session_timeout=max(60, _int("SESSION_TIMEOUT", 21600)),
+            reactions_enabled=os.getenv("BOT_REACTIONS", "on").strip().lower() not in {"0", "off", "false", "no"},
+            log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )
         cfg.download_dir.mkdir(parents=True, exist_ok=True)
         cfg.work_dir.mkdir(parents=True, exist_ok=True)

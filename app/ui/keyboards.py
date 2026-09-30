@@ -15,6 +15,23 @@ def main_menu():
     ]
 
 
+def bulk_menu(ready: int = 0, running: int = 0):
+    """Keyboard shown while collecting files in bulk mode."""
+    return [
+        [Button.inline(f"✅ Done Adding ({ready})", b"bulk:done")],
+        [Button.inline("📤 Upload All", b"bulk:upload"), Button.inline("🗑️ Clear Queue", b"bulk:clear")],
+        [Button.inline("Cancel ❌", b"cancel")],
+    ]
+
+
+def bulk_upload_menu(count: int):
+    return [
+        [Button.inline("📤 Telegram (MTProto)", b"bulkupload:telegram"), Button.inline("☁️ GoFile", b"bulkupload:gofile")],
+        [Button.inline(f"⬅️ Back to queue ({count})", b"bulk:refresh")],
+        [Button.inline("Cancel", b"cancel")],
+    ]
+
+
 def video_menu():
     return [
         [Button.inline("📋 Media Information", b"video:info")],
@@ -74,7 +91,15 @@ def archive_password_menu():
     return [[Button.inline("🔓 No Password", b"archive:nopass"), Button.inline("Cancel", b"cancel")]]
 
 
-def settings_menu(rename_enabled: bool = False, upload_mode: str = "choose", telegram_mode: str = "document", has_thumbnail: bool = False):
+def settings_menu(
+    rename_enabled: bool = False,
+    upload_mode: str = "choose",
+    telegram_mode: str = "document",
+    has_thumbnail: bool = False,
+    bulk_mode: bool = False,
+    auto_delete: bool = False,
+    keep_files: bool = False,
+):
     rename_yes = "✏️ Rename: ON ✅" if rename_enabled else "✏️ Rename: ON"
     rename_no = "✏️ Rename: OFF ✅" if not rename_enabled else "✏️ Rename: OFF"
     telegram = "📤 Upload: Telegram ✅" if upload_mode == "telegram" else "📤 Upload: Telegram"
@@ -83,12 +108,21 @@ def settings_menu(rename_enabled: bool = False, upload_mode: str = "choose", tel
     doc = "📄 Telegram as Document ✅" if telegram_mode == "document" else "📄 Telegram as Document"
     media = "🎬 Telegram as Media ✅" if telegram_mode == "media" else "🎬 Telegram as Media"
     thumb = "🖼️ Custom Thumbnail: Set" if has_thumbnail else "🖼️ Set Custom Thumbnail"
+    bulk_on = "📥 Bulk Mode: ON ✅" if bulk_mode else "📥 Bulk Mode: ON"
+    bulk_off = "📥 Bulk Mode: OFF ✅" if not bulk_mode else "📥 Bulk Mode: OFF"
+    auto_on = "🧹 Delete After Upload: ON ✅" if auto_delete else "🧹 Delete After Upload: ON"
+    auto_off = "🧹 Delete After Upload: OFF ✅" if not auto_delete else "🧹 Delete After Upload: OFF"
+    keep_on = "📦 Keep Files: ON ✅" if keep_files else "📦 Keep Files: ON"
+    keep_off = "📦 Keep Files: OFF ✅" if not keep_files else "📦 Keep Files: OFF"
     return [
         [Button.inline(rename_yes, b"settings:rename:on"), Button.inline(rename_no, b"settings:rename:off")],
         [Button.inline(telegram, b"settings:upload:telegram")],
         [Button.inline(gofile, b"settings:upload:gofile")],
         [Button.inline(choose, b"settings:upload:choose")],
         [Button.inline(doc, b"settings:telegram_mode:document"), Button.inline(media, b"settings:telegram_mode:media")],
+        [Button.inline(bulk_on, b"settings:bulk:on"), Button.inline(bulk_off, b"settings:bulk:off")],
+        [Button.inline(auto_on, b"settings:auto_delete:on"), Button.inline(auto_off, b"settings:auto_delete:off")],
+        [Button.inline(keep_on, b"settings:keep_files:on"), Button.inline(keep_off, b"settings:keep_files:off")],
         [Button.inline(thumb, b"settings:thumbnail:set")],
         [Button.inline("🗑️ Remove Custom Thumbnail", b"settings:thumbnail:remove")],
         [Button.inline("⬅️ Back", b"start:home")],

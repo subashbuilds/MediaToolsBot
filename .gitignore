@@ -4,3 +4,14 @@ __pycache__/
 *.pyc
 /data/work/*
 /data/state/*
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local tooling
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/

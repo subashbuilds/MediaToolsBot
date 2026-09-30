@@ -4,6 +4,7 @@ import types
 from pathlib import Path
 
 import aiohttp
+import pytest
 from aiohttp import web
 
 from app.services.downloader import download_url
@@ -43,11 +44,22 @@ async def _url_download_roundtrip(tmp_path):
     await site.start()
     port = site._server.sockets[0].getsockname()[1]
     try:
-        out = await download_url(f"http://127.0.0.1:{port}/file", tmp_path)
+        # 127.0.0.1 is a private address, which the downloader blocks by
+        # default so a user cannot make the bot fetch internal services.
+        # The local test server therefore opts in explicitly.
+        out = await download_url(f"http://127.0.0.1:{port}/file", tmp_path, allow_private=True)
         assert out.name == "example.mkv"
         assert out.read_bytes() == data
     finally:
         await runner.cleanup()
+
+
+def test_url_downloader_blocks_internal_addresses(tmp_path):
+    from app.services.downloader import DownloadError, download_url
+
+    for url in ("http://127.0.0.1:8080/secret", "http://169.254.169.254/latest/meta-data/", "file:///etc/passwd"):
+        with pytest.raises(DownloadError):
+            asyncio.run(download_url(url, tmp_path))
 
 
 def test_url_downloader_real_local_http(tmp_path):

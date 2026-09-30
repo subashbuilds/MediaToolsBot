@@ -12,11 +12,15 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 
 ### 📥 Input
 
-- Telegram documents, videos, audio and other media
+- Telegram documents, videos, audio, photos and other media
 - HTTP/HTTPS direct file URLs
+- A link pasted inside a longer message is detected too
 - URL input uses the same processing workflow as Telegram input
 - URL/file uploader can upload the current file to Telegram or GoFile
+- The action menu appears immediately; downloads continue in the background
+- Several files can be queued and downloaded in parallel (see Bulk mode)
 - Download progress with speed and ETA
+- Private/loopback addresses are refused so the bot cannot be used to reach internal services
 
 ### 🎥 Video
 
@@ -265,9 +269,35 @@ When a button is pressed, the same dashboard message is edited rather than sendi
 
 ### Media menu
 
-When new media is downloaded, the old processing menu is removed and a **new menu is created as the latest message**. The dashboard remains separate.
+The action menu appears **as soon as** a file or link arrives — the transfer itself runs in the background, so a slow download never blocks the user from choosing what to do next. Progress is rendered into that same menu, which means the chat does not fill up with one progress message per action.
 
-Inside a function menu, navigation edits the existing function message.
+Navigation always edits the message that is already on screen instead of sending a new one. When the tracked message can no longer be edited (deleted, or from before a restart) a fresh one is sent automatically.
+
+### 📥 Bulk mode
+
+Turn on **Settings → Bulk Mode** and the bot keeps asking for more input:
+
+```text
+📥 Bulk Mode
+
+Queued: 3   Ready: 1   Downloading: 2
+
+✅ Holiday.mp4 — 812.44 MiB
+⬇️ Episode.mkv
+    ██████████░░░░░  61.2%  512.00 MiB / 836.10 MiB  • ETA 12s
+⏳ trailer.mp4 — queued
+
+✅ Done Adding (1)
+📤 Upload All
+🗑️ Clear Queue
+```
+
+- Several files transfer **in parallel** while the user picks an action.
+- **Done Adding** hands the collected files to the normal menu; `Upload` then sends all of them.
+- **Upload All** picks a destination for the whole set in one step.
+- The bulk prompt stays up until the user explicitly finishes, so a file is never silently replaced by the next one.
+
+With bulk mode off the regular action menu is used, with a note about how many files are still downloading.
 
 ### Cancellation
 
@@ -293,10 +323,15 @@ Default limits:
 
 ```text
 Normal user: 1 active process
-Global:      10 active processes
+Global:      10 active operations
+FFmpeg:      2 concurrent jobs (auto-clamped to container RAM)
+Downloads:   3 files in parallel per user
+Single file: 2048 MiB
 Idle session: 6 hours
 Direct link: 24 hours
 ```
+
+FFmpeg and 7-Zip run under their own, smaller budget. A burst of users starting 1080p transcodes is the usual reason a small container gets OOM-killed, and a killed container takes every in-flight job with it.
 
 Temporary files are removed after successful completion, cancellation, or failed processing. A file referenced by a valid direct link is retained until its link expires.
 
@@ -348,6 +383,8 @@ New users are reported to every sudo account with their Telegram ID and username
 /urlupload
 /direct
 /merge
+/bulk on
+/bulk off
 /rename on
 /rename off
 /uploadmode telegram
@@ -368,19 +405,30 @@ Copy `.env.example` to `.env`.
 | `API_ID` | Yes | — | Telegram API ID |
 | `API_HASH` | Yes | — | Telegram API hash |
 | `BOT_TOKEN` | Yes | — | Bot-account authorization token used by Telethon over MTProto |
-| `SUDO_USERS` | No | — | Comma-separated Telegram IDs |
+| `SUDO_USERS` | No | — | Comma-separated Telegram IDs with elevated controls |
+| `ALLOWED_USERS` | No | — | Optional whitelist. Empty = everyone allowed; when set, only these IDs plus `SUDO_USERS` may use the bot |
 | `GOFILE_API_TOKEN` | No | — | Global GoFile token; blank = guest |
 | `DOWNLOAD_DIR` | No | `/data/downloads` | Temporary downloads |
 | `WORK_DIR` | No | `/data/work` | FFmpeg/work files |
 | `DB_PATH` | No | `/data/bot.sqlite3` | SQLite database |
-| `MAX_CONCURRENT_JOBS` | No | `10` | Global process limit |
+| `MAX_CONCURRENT_JOBS` | No | `10` | Global in-flight operation limit |
+| `MAX_CONCURRENT_FFMPEG_JOBS` | No | `2` | Concurrent FFmpeg/7-Zip jobs. Auto-clamped to container RAM, because parallel transcodes are the usual cause of OOM kills |
+| `MAX_PARALLEL_DOWNLOADS` | No | `3` | Files downloaded at the same time per user (max 8) |
+| `MAX_DOWNLOAD_MB` | No | `2048` | Largest single download accepted, in MiB |
+| `MAX_EXTRACT_BYTES` | No | `8589934592` | Largest expanded size accepted when extracting an archive (decompression-bomb guard) |
+| `FFMPEG_TIMEOUT` | No | `14400` | Hard wall-clock limit for one FFmpeg job, in seconds |
 | `PROGRESS_INTERVAL` | No | `3` | Progress update interval in seconds |
 | `SESSION_TIMEOUT` | No | `21600` | Idle session timeout |
+| `BOT_REACTIONS` | No | `on` | Set to `off` to disable the automatic message reaction |
+| `LOG_LEVEL` | No | `INFO` | Logging level |
+| `ALLOW_PRIVATE_DOWNLOADS` | No | off | Set to `1` to allow downloads from private/loopback addresses. Leave unset in production: the bot refuses internal targets to prevent SSRF |
 | `PUBLIC_BASE_URL` | No | auto | Public direct-link origin |
 | `WEB_HOST` | No | `0.0.0.0` | Direct-link server bind address |
 | `WEB_PORT` | No | `8080` | Direct-link server port |
 | `DIRECT_LINK_TTL` | No | `86400` | Direct-link lifetime |
 | `TELEGRAPH_ACCESS_TOKEN` | No | auto account | Optional reusable Telegraph token |
+
+Malformed values in any of these fall back to the documented default instead of preventing the bot from starting.
 
 ---
 
@@ -482,7 +530,7 @@ The test suite covers:
 - Multi-part archive naming
 - Telegram chunk sizing
 - UI callback contracts
-- Settings persistence
+- Settings persistence, including bulk mode
 - GoFile payload/folder contracts
 - Cancellation/process control
 - Direct-link behavior
@@ -490,6 +538,9 @@ The test suite covers:
 - URL workflows
 - Timeout cleanup
 - Sudo administration
+- The background download queue (parallelism, pausing, cancellation, promotion)
+- A scripted end-to-end bulk session against a fake Telegram client
+- Regression tests for every bug fixed in the latest pass (trim bounds, MP4 audio, progress throttling, split naming, timecode validation, config tolerance, SSRF guard)
 
 ---
 
@@ -502,6 +553,7 @@ The test suite covers:
 │   ├── config.py
 │   ├── services/
 │   │   ├── archive.py
+│   │   ├── bulk.py
 │   │   ├── downloader.py
 │   │   ├── ffmpeg.py
 │   │   ├── ffprobe.py
