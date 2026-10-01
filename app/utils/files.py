@@ -65,6 +65,41 @@ def format_bytes(n: int | float) -> str:
     return f"{n:.2f} PiB"
 
 
+def format_bytes_short(n: int | float) -> str:
+    """Compact size for a progress line: ``598 MiB``, not ``598.00 MiB``.
+
+    The full two-decimal form is right for a file listing and far too long for
+    a line that also carries a bar, a percentage and a speed.
+    """
+    value = float(n)
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    for unit in units:
+        if abs(value) < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{value:.0f} {unit}"
+            return f"{value:.1f} {unit}" if value < 10 else f"{value:.0f} {unit}"
+        value /= 1024
+    return f"{value:.0f} PiB"
+
+
+def format_eta(seconds: float | None) -> str:
+    """Human ETA in minutes: ``45s``, ``12m``, ``1h 05m``.
+
+    Progress used to print raw seconds, so a normal 40 minute wait appeared as
+    ``ETA 2461s``.
+    """
+    if seconds is None or seconds < 0 or seconds != seconds or seconds == float("inf"):
+        return "--"
+    total = int(round(seconds))
+    if total < 60:
+        return f"{max(1, total)}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m" if secs < 30 else f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
 def format_duration(seconds: float | None) -> str:
     if seconds is None or seconds < 0:
         return "--:--"

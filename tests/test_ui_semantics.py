@@ -14,6 +14,7 @@ the two failures users actually hit:
 This module models those two Telegram behaviours faithfully.
 """
 import asyncio
+import re
 import sys
 import types
 from pathlib import Path
@@ -91,6 +92,9 @@ class FaithfulClient:
         self._next += 1
         msg = FaithfulMsg(self._next, self)
         msg.text = text
+        # A real sent message carries its inline keyboard, so the double must
+        # too - several tests read the buttons off the newest card.
+        msg.buttons = buttons
         msg.markup_omitted_keeps = buttons is not None
         msg._signature = msg._sig(text, buttons)
         self.messages[(chat_id, self._next)] = msg
@@ -163,35 +167,38 @@ def test_action_during_download_waits_instead_of_refusing(tmp_path):
         st = bot.state(5)
         from app.services.bulk import QueueItem
 
-        # Keep the repaint cadence quick so the test stays fast while still
-        # proving that a real percentage is rendered mid-transfer.
-        original_interval = main_mod.PANEL_INTERVAL
-        main_mod.PANEL_INTERVAL = 0.05
-        try:
-            # An input the user has not acted on yet: the action starts it.
-            queued = st.queue.add(QueueItem(kind="url", label="a.mkv", chat_id=5, url="https://x/a.mkv"))
-            st.current_item = queued
+        # The repaint cadence is PROGRESS_INTERVAL. Keep it at the floor so the
+        # test still proves the panel keeps updating during a longer transfer.
+        bot.cfg.progress_interval = 0.5
+        # An input the user has not acted on yet: the action starts it.
+        queued = st.queue.add(QueueItem(kind="url", label="a.mkv", chat_id=5, url="https://x/a.mkv"))
+        st.current_item = queued
 
-            async def slow_download(u, item):
-                for step in range(1, 5):
-                    item.current, item.total = step * 512, 2048
-                    await asyncio.sleep(0.06)
-                target = tmp_path / "a.mkv"
-                target.write_bytes(b"x" * 2048)
-                return target
+        async def slow_download(u, item):
+            steps = 12
+            for step in range(1, steps + 1):
+                item.advance(step * 2048 // steps, 2048)
+                await asyncio.sleep(0.1)
+            target = tmp_path / "a.mkv"
+            target.write_bytes(b"x" * 2048)
+            return target
 
-            bot._download_url_item = slow_download
-            got = await bot.await_input(1, 5, timeout=5.0)
-        finally:
-            main_mod.PANEL_INTERVAL = original_interval
+        bot._download_url_item = slow_download
+        got = await bot.await_input(1, 5, timeout=5.0)
         assert got is not None, "action must wait for the download it started"
         assert got.exists()
         return client
 
     client = asyncio.run(run())
-    # It should have shown real progress rather than an error/refusal.
     assert any("Still downloading" in t for t in client.rendered)
-    assert any("%" in t and "ETA" in t for t in client.rendered), client.rendered
+    # The progress card must be repainted while the transfer runs, not once.
+    painted = [t for t in client.rendered if "a.mkv" in t and "%" in t]
+    assert len(set(painted)) >= 2, painted
+    percents = {float(p) for t in painted for p in re.findall(r"(\d+\.\d)%", t)}
+    assert max(percents) > 0, percents
+    # Speed and an ETA are on the card while it is running.
+    assert any("⚡" in t and "left" in t for t in painted), painted
+    assert not any("ETA 2461s" in t for t in client.rendered)
 
 
 def test_action_without_any_file_still_reports_clearly(tmp_path):

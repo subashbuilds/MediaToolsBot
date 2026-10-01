@@ -52,7 +52,6 @@ def test_sweep_orphans_is_not_a_bare_coroutine():
 def test_download_panel_shows_a_progress_bar(tmp_path):
     """The panel used to print only the filename, so a live download looked dead."""
     from app.services.bulk import DOWNLOADING, QueueItem
-    from app.services.bulk import DownloadQueue
 
     async def run():
         bot = make_bot(tmp_path, FaithfulClient())
@@ -63,16 +62,24 @@ def test_download_panel_shows_a_progress_bar(tmp_path):
             kind="telegram", label="1080p.mkv", chat_id=1,
             status=DOWNLOADING, current=5 * 1024**2, total=10 * 1024**2,
         )
+        # Two readings with a gap, so the smoothed speed is a real number.
+        item.advance(2 * 1024**2, 10 * 1024**2)
+        await asyncio.sleep(0.2)
+        item.advance(5 * 1024**2, 10 * 1024**2)
         st.queue.items.append(item)
         await bot._render_queue_panel(uid, 1, force=True)
         return bot.client.rendered[-1]
 
     text = asyncio.run(run())
     assert "1080p.mkv" in text
-    # A bar, the byte counts and an ETA are what make it visibly alive.
-    assert "5.00 MiB" in text and "10.00 MiB" in text, text
-    assert "%" in text, text
-    assert "ETA" in text, text
+    # A bar, the byte counts, the speed and an ETA in minutes are what make it
+    # visibly alive. The ETA used to be raw seconds ("ETA 2461s").
+    assert "5.0 MiB" in text and "10.00 MiB" in text, text
+    assert "50.0%" in text, text
+    assert "⚡" in text, text
+    assert "/s" in text, text
+    assert "left" in text, text
+    assert "ETA 2461s" not in text
 
 
 def test_pressing_a_button_is_not_overwritten_by_the_panel(tmp_path):
@@ -155,8 +162,14 @@ def test_merge_duration_probe_caches(tmp_path):
     async def run():
         bot = make_bot(tmp_path, FaithfulClient())
         bot._probe = None
+        # Restore it afterwards: leaving the stub installed leaks into every
+        # later test in the session and makes the suite order-dependent.
+        original = main_mod.ffprobe.safe_probe
         main_mod.ffprobe.safe_probe = lambda p: {"format": {"duration": "42.5"}}
-        await bot._probe_merge_duration(1, src.resolve())
+        try:
+            await bot._probe_merge_duration(1, src.resolve())
+        finally:
+            main_mod.ffprobe.safe_probe = original
         return bot.state(1).merge_durations
 
     durations = asyncio.run(run())

@@ -30,6 +30,7 @@ from .services import ffmpeg, ffprobe
 from .services.archive import extract_archive, is_archive, archive_requires_password, multipart_info
 from .services.bulk import DownloadQueue, QueueItem, render_bulk_prompt, render_queue
 from .services.downloader import download_url
+from .services.telegram_download import download_media_multipart
 from .services.gofile import upload_gofile, create_folder
 from .services.telegraph import create_info_page
 from .services.merge import merge_tracks
@@ -172,6 +173,15 @@ class UserState:
     # transferred.
     current_item: object | None = None
     probe_data: dict | None = None
+    # True while a submenu (Video, Audio, Stream Remover, …) is on screen.
+    submenu: bool = False
+    # "remove" | "extract": which stream screen the user is working in, so the
+    # custom-selection screen survives a round trip through a button.
+    view_mode: str | None = None
+    # Shared throttle for the progress repaint, so the panel edits a message
+    # at most once per PROGRESS_INTERVAL however many renderers are running.
+    last_panel_at: float = 0.0
+    last_panel_text: str | None = None
     last_reaction: float = 0.0
     # The single interactive "card" message: always the newest bot message.
     card_message_id: int | None = None
@@ -836,6 +846,7 @@ class MediaToolsBot:
         return await self.render_ui(entity, uid, text, buttons=buttons, parse_mode="html", source=source, kind="start")
 
     async def send_main(self, entity, uid: int, prefix: str | None = None, source=None):
+        self.state(uid).submenu = False
         text = (prefix + "\n\n" if prefix else "") + "Please select your preferred action below 👇"
         return await self.render_ui(entity, uid, text, buttons=main_menu(), source=source)
 
@@ -1011,7 +1022,7 @@ class MediaToolsBot:
                 # tracked, it just must not overwrite their current screen.
                 if st.view == "queue":
                     await self._render_queue_panel(uid, chat_id=st.ui_chat_id or uid)
-                await asyncio.sleep(PANEL_INTERVAL)
+                await asyncio.sleep(self._panel_interval())
         except asyncio.CancelledError:
             return
         except Exception:
@@ -1048,22 +1059,60 @@ class MediaToolsBot:
             inflight = st.queue.running()
             if inflight:
                 # Reuse the shared renderer so the running item shows a real
-                # bar, byte counts and ETA. It used to print only the filename,
-                # which made a healthy download look completely frozen.
+                # bar, byte counts, speed and ETA. It used to print only the
+                # filename, which made a healthy download look completely frozen.
+                if not self._panel_due(st, fresh):
+                    return None
                 text = render_queue(st.queue, None, bulk=False)
-                text += (
-                    "\n\n⏳ <i>Still downloading — the action you picked runs as soon as "
-                    "the transfer finishes.</i>"
-                )
-                return await self.render_card(chat_id, uid, text, buttons=main_menu(), fresh=fresh)
+                buttons = cancel_menu() if st.submenu else main_menu()
+                return await self._render_panel(chat_id, uid, st, text, buttons)
             if st.path is not None:
                 return await self.show_file_menu(chat_id, uid, st.path, fresh=fresh)
             return await self.render_card(
                 chat_id, uid, self._pending_card_text(uid), buttons=main_menu(), fresh=fresh,
             )
         active = st.path.name if st.path else None
+        if running and not self._panel_due(st, fresh):
+            return None
         text = render_queue(st.queue, active, bulk=True)
-        return await self.render_card(chat_id, uid, text, buttons=bulk_menu(done, running), fresh=fresh or bool(force and not st.card_message_id))
+        return await self._render_panel(chat_id, uid, st, text, bulk_menu(done, running))
+
+    def _panel_interval(self) -> float:
+        """Cadence of the progress repaint, in seconds.
+
+        Driven by PROGRESS_INTERVAL (3s by default). Telegram limits how often
+        one message can be edited, so the panel must not repaint faster than
+        the operator asked for, no matter how many renderers are active.
+        """
+        try:
+            # The floor only guards against a nonsensical 0; an operator who
+            # asks for a 1s panel gets a 1s panel.
+            return max(0.5, float(self.cfg.progress_interval))
+        except (AttributeError, TypeError, ValueError):
+            return PANEL_INTERVAL
+
+    def _panel_due(self, st: UserState, fresh: bool) -> bool:
+        """True when enough time passed to repaint the progress card again.
+
+        Two renderers can be active at once - the loop that waits for the
+        transfer and the bulk panel ticker - and each used to repaint on its own
+        schedule. One shared timestamp keeps the total rate at the configured
+        interval.
+        """
+        if fresh:
+            return True
+        now = time.monotonic()
+        if now - st.last_panel_at < self._panel_interval():
+            return False
+        st.last_panel_at = now
+        return True
+
+    async def _render_panel(self, chat_id, uid, st, text: str, buttons) -> None:
+        """Repaint the progress card, skipping edits that would change nothing."""
+        if text == st.last_panel_text and st.card_message_id:
+            return None
+        st.last_panel_text = text
+        return await self.render_card(chat_id, uid, text, buttons=buttons)
 
     def _pending_card_text(self, uid: int) -> str:
         """The card for an input that has not been downloaded yet."""
@@ -1120,6 +1169,9 @@ class MediaToolsBot:
         st.streams.clear()
         st.probe_data = None
         st.view = "menu"
+        st.submenu = False
+        st.last_panel_text = None
+        st.last_panel_at = 0.0
         st.queue_cancel.clear()
         st.card_message_id = None
         st.card_chat_id = None
@@ -1198,7 +1250,11 @@ class MediaToolsBot:
         st.root_path = path
         st.original_name = item.display_name
         st.outputs = [path]
-        st.streams = []
+        # The promoted file is the item we already probed, so its track list
+        # still applies. Blanking it here lost the user's Stream Remover
+        # selection in the moment the download completed.
+        st.streams = list(item.streams)
+        st.probe_data = item.probe_data
 
     def _ensure_metadata(self, uid: int, item: QueueItem) -> None:
         """Kick off the header probe for a freshly queued input."""
@@ -1330,8 +1386,7 @@ class MediaToolsBot:
         async def cb(current: int, total: int) -> None:
             if st.queue_cancel.is_set():
                 raise asyncio.CancelledError
-            item.current = int(current or 0)
-            item.total = int(total or 0)
+            item.advance(int(current or 0), int(total or 0))
             self.refresh_activity(uid)
 
         return await download_url(
@@ -1350,15 +1405,22 @@ class MediaToolsBot:
         if file is None:
             raise RuntimeError("This message no longer contains a file")
         out = unique_path(dest, item.display_name)
+        size = int(getattr(file, "size", 0) or item.expected_size or 0)
 
         async def cb(current: int, total: int) -> None:
             if st.queue_cancel.is_set():
                 raise asyncio.CancelledError
-            item.current = int(current or 0)
-            item.total = int(total or item.expected_size or 0)
+            item.advance(int(current or 0), int(total or size or 0))
             self.refresh_activity(uid)
 
-        result = await self.client.download_media(message, file=str(out), progress_callback=cb)
+        result = await download_media_multipart(
+            self.client, message, out,
+            file_size=size,
+            parts=self.cfg.telegram_parts,
+            progress=cb,
+            cancel_event=st.queue_cancel,
+            min_bytes=self.cfg.telegram_parts_min_mb * 1024 * 1024,
+        )
         if not result:
             raise RuntimeError("Telegram returned no downloaded file")
         return out
@@ -1379,6 +1441,7 @@ class MediaToolsBot:
             st.streams.clear()
             return await self.send_main(chat_id, uid, source=source)
         st.view = "menu"
+        st.submenu = False
         bulk = self.db.get_bulk_mode(uid)
         archive_note = "\n📦 <b>Archive detected:</b> Extract Archive is available." if is_archive(path) else ""
         inflight = st.queue.pending() + st.queue.running()
@@ -1841,6 +1904,21 @@ class MediaToolsBot:
             except Exception:
                 pass
 
+    @staticmethod
+    def _opens_submenu(data: str) -> bool:
+        """True when a callback leads to a screen below the main menu.
+
+        The download panel keeps the user's place: it shows only a Cancel
+        button while a submenu is open, instead of yanking them back to the
+        main menu mid-operation.
+        """
+        if data.endswith(":back") or data == "cancel":
+            return False
+        return data.startswith((
+            "menu:", "video:", "audio:", "stream:", "streamtoggle:",
+            "aconv:", "archive", "merge", "upload:", "bulkupload:",
+        ))
+
     async def callback_router(self, event, uid: int, data: str):
         st = self.state(uid)
         # Any button press other than the queue's own refresh means the user has
@@ -1849,6 +1927,10 @@ class MediaToolsBot:
         # to open the next menu and then snap straight back to the main menu.
         if not data.startswith("bulk:"):
             st.view = "menu"
+            # Remember that the card now shows a submenu, not the main menu.
+            # The download panel used to repaint over an open submenu with the
+            # main menu, so tapping "Custom Streams" looked like a jump home.
+            st.submenu = self._opens_submenu(data)
         if data == "cancel":
             await self.cancel(uid, event.chat_id, event); return
         if data == "start:home":
@@ -2074,16 +2156,32 @@ class MediaToolsBot:
             idx = int(data.split(":", 1)[1])
             if idx in st.custom_remove: st.custom_remove.remove(idx)
             else: st.custom_remove.add(idx)
-            rows = [[Button.inline(("❌ " if s.get("index") in st.custom_remove else "") + ffprobe.stream_label(s)[:58], f"streamtoggle:{s.get('index')}".encode())] for s in st.streams]
-            rows += [[Button.inline("✅ Apply", b"streamapply"), Button.inline("Cancel", b"cancel")]]
-            await self.safe_edit(event, "Custom Streams: select streams to remove, then Apply.", buttons=rows); return
+            # Re-render the same screen so the selection stays visible instead
+            # of collapsing into a single line of text.
+            await self.stream_custom_menu(event.chat_id, uid, st.view_mode or "remove", source=event)
+            return
         if data == "streamapply":
+            if not st.custom_remove:
+                await self.stream_custom_menu(event.chat_id, uid, st.view_mode or "remove", source=event)
+                await self.answer(event, "Select at least one track first.", alert=True)
+                return
+            # Resolve the selection *before* the transfer: the track list belongs
+            # to the input the user chose from, not to whatever the background
+            # probe happens to have produced by the time it finishes.
+            chosen = set(st.custom_remove)
+            keep = [s.get("index") for s in st.streams if s.get("index") not in chosen]
+            if not keep:
+                await self.answer(event, "That selection would leave no streams.", alert=True)
+                return
+            # Applying rewrites the file, so this is where the media is fetched.
             await self.await_input(event.chat_id, uid)
             target = self.source_media(st)
-            if not target: return
-            keep = [s.get("index") for s in st.streams if s.get("index") not in st.custom_remove]
+            if not target:
+                await self.answer(event, "That file is not available any more.", alert=True)
+                return
             if not keep:
-                await self.safe_edit(event, "❌ You cannot remove every stream.", buttons=cancel_menu()); return
+                await self.answer(event, "You cannot remove every stream.", alert=True)
+                return
             out = unique_path(self.cfg.work_dir / str(uid), f"{target.stem}.custom.mkv")
             await self.execute(event.chat_id, uid, "🧹 Removing custom streams", lambda: ffmpeg.remux(target, out, keep), upload=True, set_source=True); return
         if data.startswith("aconv:"):
@@ -2239,14 +2337,25 @@ class MediaToolsBot:
     async def handle_stream_callback(self, event, uid: int, data: str):
         _, mode, value = data.split(":", 2)
         st = self.state(uid)
-        # Removing or extracting a stream rewrites the file, so this is the
-        # point where the queued media is actually downloaded - with progress.
+        # The track list comes from the container header, so the selection
+        # screens work without the media. Downloading here is what made
+        # "Custom Streams" look like it jumped back to the main menu: the tap
+        # started a transfer and the progress panel replaced the submenu.
+        streams = await self._resolve_streams(uid)
+        if not streams:
+            await self.answer(event, "This file has no audio or video tracks.", alert=True)
+            return
+        if value == "custom":
+            st.custom_remove.clear()
+            await self.stream_custom_menu(event.chat_id, uid, mode)
+            return
+        # Everything else rewrites the file, so this is where the transfer
+        # starts - with progress, and without losing the open submenu.
         await self.await_input(event.chat_id, uid)
         target = self.source_media(st)
         if not target:
             await self.answer(event, "That file is not available any more.", alert=True)
             return
-        streams = st.streams or (await asyncio.to_thread(ffprobe.safe_probe, target)).get("streams", [])
         if value.isdigit():
             idx = int(value)
             s = next((x for x in streams if x.get("index") == idx), None)
@@ -2260,11 +2369,6 @@ class MediaToolsBot:
                 out = unique_path(self.cfg.work_dir / str(uid), f"{target.stem}.streams_removed.mkv")
                 await self.execute(event.chat_id, uid, "🧹 Removing stream", lambda: ffmpeg.remux(target, out, keep), upload=True, set_source=True)
             return
-        if value == "custom":
-            st.custom_remove.clear()
-            rows = [[Button.inline(ffprobe.stream_label(s)[:60], f"streamtoggle:{s.get('index')}")] for s in streams]
-            rows += [[Button.inline("✅ Apply", b"streamapply"), Button.inline("Cancel", b"cancel")]]
-            await self.safe_edit(event, "Custom Streams: select streams to remove, then Apply.", buttons=rows); return
         if value in {"drop_audio", "keep_audio"}:
             audio = [s for s in streams if s.get("codec_type") == "audio"]
             if not audio:
@@ -2311,13 +2415,11 @@ class MediaToolsBot:
     def _is_nondefault(s: dict) -> bool:
         return not bool(s.get("disposition", {}).get("default"))
 
-    async def _streams_for_menu(self, chat_id: int, uid: int) -> list[dict]:
-        """Return the current input's track list, downloading only if forced to.
+    async def _resolve_streams(self, uid: int) -> list[dict]:
+        """The current input's track list, from the header or a known file.
 
-        Metadata normally comes from the header read that happened when the
-        input arrived, so opening Stream Remover/Extractor never transfers the
-        media. The full file is only fetched when no header could be read, and
-        even then the transfer runs with the usual progress.
+        Never downloads: if nothing is known yet it returns an empty list and
+        the caller decides whether fetching the file is worth it.
         """
         st = self.state(uid)
         if st.streams:
@@ -2332,7 +2434,27 @@ class MediaToolsBot:
                 return streams
         target = self.source_media(st)
         if not target or not target.exists():
-            target = await self.await_input(chat_id, uid) or target
+            return []
+        data = await asyncio.to_thread(ffprobe.safe_probe, target)
+        if data:
+            st.probe_data = data
+        st.streams = (data or {}).get("streams") or []
+        return st.streams
+
+    async def _streams_for_menu(self, chat_id: int, uid: int) -> list[dict]:
+        """Return the current input's track list, downloading only if forced to.
+
+        Metadata normally comes from the header read that happened when the
+        input arrived, so opening Stream Remover/Extractor never transfers the
+        media. The full file is only fetched when no header could be read, and
+        even then the transfer runs with the usual progress.
+        """
+        st = self.state(uid)
+        streams = await self._resolve_streams(uid)
+        if streams:
+            return streams
+        # No header could be read: fetch the file, then probe it locally.
+        target = await self.await_input(chat_id, uid) or self.source_media(st)
         if not target or not target.exists():
             await self.render_card(chat_id, uid, "Send a media file first.", buttons=main_menu())
             return []
@@ -2348,6 +2470,36 @@ class MediaToolsBot:
                 buttons=main_menu(),
             )
         return streams
+
+    async def stream_custom_menu(self, chat_id: int, uid: int, mode: str, source=None):
+        """The "tap the tracks to remove" screen.
+
+        It is a full screen with its own state, not a one-line edit: tapping a
+        track used to replace the whole submenu with a bare sentence, and the
+        selection was invisible on the way back.
+        """
+        st = self.state(uid)
+        streams = st.streams
+        mode = mode if mode in {"remove", "extract"} else "remove"
+        st.view_mode = mode
+        action = "extract" if mode == "extract" else "remove"
+        rows = []
+        for s in streams:
+            idx = s.get("index")
+            mark = "❌ " if idx in st.custom_remove else "✅ "
+            rows.append([Button.inline((mark + ffprobe.stream_label(s))[:58], f"streamtoggle:{idx}".encode())])
+        rows.append([
+            Button.inline("✅ Apply", b"streamapply"),
+            Button.inline("Cancel", b"cancel"),
+            Button.inline("⬅️ Back", b"video:back"),
+        ])
+        chosen = len(st.custom_remove)
+        header = (
+            f"\U0001F9F9 <b>Custom Streams</b>\n"
+            f"Tap every track you want to <b>{action}</b>, then press <b>Apply</b>.\n"
+            f"Selected: <b>{chosen}</b> of {len(streams)}  •  the file is downloaded only when you apply"
+        )
+        return await self.render_ui(chat_id, uid, header, buttons=rows, source=source)
 
     async def stream_remux(self, chat_id, uid, keep):
         st = self.state(uid)
@@ -2404,6 +2556,7 @@ class MediaToolsBot:
         # otherwise a fast transfer finishes without the user ever seeing it.
         await asyncio.sleep(0)
         deadline = time.monotonic() + timeout
+        interval = self._panel_interval()
         while True:
             st = self.state(uid)
             if st.path and st.path.exists():
@@ -2427,7 +2580,7 @@ class MediaToolsBot:
                         buttons=cancel_menu(), parse_mode="html",
                     )
                 return None
-            await asyncio.sleep(PANEL_INTERVAL)
+            await asyncio.sleep(interval)
 
     async def _render_queue_failure(self, chat_id: int, uid: int) -> None:
         """Explain a failed transfer instead of claiming no file was sent."""
@@ -2456,13 +2609,14 @@ class MediaToolsBot:
         self._start_worker(uid)
         await asyncio.sleep(0)
         deadline = time.monotonic() + timeout
+        interval = self._panel_interval()
         while time.monotonic() < deadline:
             st = self.state(uid)
             if not st.queue.has_work() or st.cancel_event.is_set():
                 break
             with contextlib.suppress(Exception):
                 await self._render_queue_panel(uid, chat_id, force=True)
-            await asyncio.sleep(PANEL_INTERVAL)
+            await asyncio.sleep(interval)
         st = self.state(uid)
         if st.queue.failed():
             await self._render_queue_failure(chat_id, uid)

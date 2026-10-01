@@ -20,7 +20,8 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 - The action menu appears immediately; the transfer starts only when you pick an action
 - Media Information and the track lists are built from the file header, so they work without downloading the media
 - Several files can be queued and downloaded in parallel (see Bulk mode)
-- Download progress with speed and ETA
+- Telegram files are fetched in several byte ranges at once, not one request at a time
+- Download progress with speed, size/total and an ETA in minutes
 - Private/loopback addresses are refused so the bot cannot be used to reach internal services
 
 ### 🎥 Video
@@ -30,7 +31,7 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 - Stream Extractor
 - Individual stream selection
 - All audio / all subtitle selection
-- Custom stream selection
+- Custom stream selection: a full screen where every track is listed and taps are marked, and nothing is downloaded until **Apply**
 - Video trimmer
 - Remove audio
 - Lossless optimize/remux
@@ -293,6 +294,23 @@ The action menu appears **as soon as** a file or link arrives, but nothing is tr
 Please select your preferred action below 👇
 ```
 
+### Download progress
+
+```text
+⬇️ 1080p.mkv [1v+5a]
+    ███████░░░░░░░  19.8% · 598 MiB / 2.95 GiB
+    ⚡ 4.1 MiB/s · ⏳ 11m left
+```
+
+The ETA is printed in minutes rather than raw seconds, the speed is measured
+over the last interval and smoothed, and the card is repainted at most once per
+`PROGRESS_INTERVAL` no matter how many parts or files are transferring.
+
+Telegram media is read as several byte ranges at once (`TELEGRAM_DOWNLOAD_PARTS`,
+default 4) because one request in flight is what makes a large file crawl. The
+ranges are aligned to the size Telegram serves, the file is verified before it is
+used, and any problem falls back to the ordinary single-stream download.
+
 What can be answered **without downloading the media**:
 
 | Action | Needs the file? |
@@ -450,13 +468,15 @@ Copy `.env.example` to `.env`.
 | `MAX_CONCURRENT_JOBS` | No | `10` | Global in-flight operation limit |
 | `MAX_CONCURRENT_FFMPEG_JOBS` | No | `2` | Concurrent FFmpeg/7-Zip jobs. Auto-clamped to container RAM, because parallel transcodes are the usual cause of OOM kills |
 | `MAX_PARALLEL_DOWNLOADS` | No | `3` | Files downloaded at the same time per user (max 8) |
+| `TELEGRAM_DOWNLOAD_PARTS` | No | `4` | Byte ranges read concurrently for one Telegram file (1–8). `1` disables the ranged downloader and uses a single stream. Any ranged failure silently falls back to the single-stream path, so this can only make things faster |
+| `TELEGRAM_PARTS_MIN_MB` | No | `24` | Files smaller than this are never split; below it the range bookkeeping costs more than it saves |
 | `MAX_DOWNLOAD_MB` | No | `0` (unlimited) | Largest single download accepted, in MiB. `0` means no cap. Telegram's 2 GiB ceiling is an **upload** limit and is applied only when sending to Telegram; downloads are unrestricted unless you set this. Disk safety comes from `MIN_FREE_BYTES` instead |
 | `MAX_EXTRACT_BYTES` | No | `8589934592` | Largest expanded size accepted when extracting an archive (decompression-bomb guard) |
 | `FFMPEG_TIMEOUT` | No | `14400` | Hard wall-clock limit for one FFmpeg job, in seconds |
 | `MIN_FREE_BYTES` | No | `536870912` | Free disk space required before a download starts. Guards against filling the disk once downloads are uncapped |
 | `FFPROBE_REMOTE_TIMEOUT` | No | `45` | Timeout for reading container metadata straight from a link, in seconds |
 | `PROBE_HEAD_BYTES` | No | `8388608` | How much of a Telegram file is fetched to read its container header when the track list or Media Information is requested. The prefix is deleted right after probing; if it is not enough the action falls back to a full download |
-| `PROGRESS_INTERVAL` | No | `3` | Progress update interval in seconds |
+| `PROGRESS_INTERVAL` | No | `3` | Progress update interval in seconds. Also the cadence of the download panel: however many renderers are active, the progress message is edited at most this often |
 | `SESSION_TIMEOUT` | No | `21600` | Idle session timeout |
 | `BOT_REACTIONS` | No | `on` | Set to `off` to disable the automatic message reaction |
 | `LOG_LEVEL` | No | `INFO` | Logging level |

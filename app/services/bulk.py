@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..utils.files import esc, format_bytes, progress_bar
+from ..utils.files import esc, format_bytes, format_bytes_short, format_eta, progress_bar
 
 QUEUED = "queued"
 DOWNLOADING = "downloading"
@@ -48,6 +48,29 @@ class QueueItem:
     probed: bool = False
     # Background remote-metadata probe, cancelled with the download.
     probe_task: object | None = None
+    # Smoothed transfer speed in bytes/second, kept up to date by ``advance``.
+    speed: float = 0.0
+    _last_current: int = 0
+    _last_at: float | None = None
+
+    def advance(self, current: int, total: int) -> None:
+        """Record progress and update the smoothed speed.
+
+        Averages taken over the whole transfer either lag badly or jump on the
+        first chunk, so the speed is measured over the last interval and
+        smoothed - that is the number a user reads as "how fast is this".
+        """
+        current = int(current or 0)
+        now = time.monotonic()
+        if self._last_at is not None and now > self._last_at:
+            delta = current - self._last_current
+            if delta > 0:
+                instant = delta / (now - self._last_at)
+                self.speed = instant if self.speed <= 0 else self.speed * 0.6 + instant * 0.4
+        self._last_current = current
+        self._last_at = now
+        self.current = current
+        self.total = int(total or 0)
 
     @property
     def audio_count(self) -> int:
@@ -76,8 +99,11 @@ class QueueItem:
     def eta(self) -> float | None:
         if self.status != DOWNLOADING or self.total <= 0 or self.current <= 0:
             return None
-        elapsed = max(0.001, time.monotonic() - self.started_at)
-        speed = self.current / elapsed
+        speed = self.speed
+        if speed <= 0:
+            # No interval measured yet: fall back to the overall average.
+            elapsed = max(0.001, time.monotonic() - self.started_at)
+            speed = self.current / elapsed
         if speed <= 0:
             return None
         return max(0.0, (self.total - self.current) / speed)
@@ -212,12 +238,20 @@ def _item_line(item: QueueItem) -> str:
     if item.status == DOWNLOADING:
         bar = progress_bar(int(item.current), int(item.total))
         if item.total:
-            text = f"{bar} {item.percent:5.1f}%  {format_bytes(item.current)} / {format_bytes(item.total)}"
-            if item.eta is not None:
-                text += f"  • ETA {int(item.eta)}s"
+            # Short for the running figure, exact for the total: the total is
+            # fixed and worth the two decimals, the current one changes every
+            # few seconds and would push the line into a wrap.
+            sizes = f"{format_bytes_short(item.current)} / {format_bytes(item.total)}"
         else:
-            text = f"{bar} {format_bytes(item.current)}"
-        return f"⬇️ <b>{name}</b>\n    {text}"
+            sizes = f"{format_bytes_short(item.current)} downloaded"
+        # Speed and ETA share the second line so the bar stays full width and
+        # the line never wraps in the middle of the numbers.
+        line = f"    {bar} {item.percent:5.1f}% · {sizes}"
+        if item.speed > 0:
+            line += f"\n    ⚡ {format_bytes_short(item.speed)}/s · ⏳ {format_eta(item.eta)} left"
+        elif item.eta is not None:
+            line += f"\n    ⏳ {format_eta(item.eta)} left"
+        return f"⬇️ <b>{name}</b>\n{line}"
     return f"⏳ <b>{name}</b> — ready to download"
 
 

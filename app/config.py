@@ -16,6 +16,12 @@ DEFAULT_FFMPEG_JOBS = 2
 # unless the operator opts in with MAX_DOWNLOAD_MB. Disk exhaustion is still
 # guarded at request time by a free-space check in the downloader.
 DEFAULT_MAX_DOWNLOAD_MB = 0
+# Telegram media is served through a ranged API, so several ranges can be read
+# at once. One range is a single request in flight, which is why a large file
+# crawled with a huge ETA. 1 disables the ranged downloader.
+DEFAULT_TELEGRAM_PARTS = 4
+# Below this size the range bookkeeping costs more than it saves.
+DEFAULT_TELEGRAM_PARTS_MIN_MB = 24
 
 
 def _int(name: str, default: int) -> int:
@@ -117,6 +123,8 @@ class Config:
     max_download_mb: int
     max_parallel_downloads: int
     progress_interval: float
+    telegram_parts: int
+    telegram_parts_min_mb: int
     sudo_users: frozenset[int]
     allowed_users: frozenset[int]
     public_base_url: str | None
@@ -149,6 +157,8 @@ class Config:
             max_download_mb=max(0, _int("MAX_DOWNLOAD_MB", DEFAULT_MAX_DOWNLOAD_MB)),
             max_parallel_downloads=max(1, min(8, _int("MAX_PARALLEL_DOWNLOADS", 3))),
             progress_interval=max(1.0, _float("PROGRESS_INTERVAL", 3)),
+            telegram_parts=max(1, min(8, _int("TELEGRAM_DOWNLOAD_PARTS", DEFAULT_TELEGRAM_PARTS))),
+            telegram_parts_min_mb=max(0, _int("TELEGRAM_PARTS_MIN_MB", DEFAULT_TELEGRAM_PARTS_MIN_MB)),
             sudo_users=_str_ids("SUDO_USERS"),
             allowed_users=_str_ids("ALLOWED_USERS"),
             public_base_url=_detect_public_base_url(),

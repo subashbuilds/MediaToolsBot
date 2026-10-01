@@ -8,7 +8,7 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-163 passed
+181 passed
 
 MEDIABOT_LIVE=1 pytest -q tests/test_live_integrations.py
 3 passed
@@ -186,6 +186,54 @@ The fix:
 
 `tests/test_on_demand_download.py` pins all of it, including a real FFmpeg
 stream removal — the exact call that raised the reported `TypeError`.
+
+The ranged Telegram downloader is verified against a double that serves real
+byte ranges (byte-for-byte reassembly, parallelism, cancellation and the
+fallback path) and against the **installed Telethon signature**, so a library
+change fails a test instead of production. A live multi-gigabyte Telegram
+transfer still cannot be exercised from here — that needs a real user account
+sending a document to the bot, not a bot token.
+
+## Bugs fixed in the transfer-speed and stream-selection pass
+
+Reported from a live session: a 2.95 GiB Telegram file crawled with
+`ETA 2461s` and no speed, and tapping **Custom Streams** in the audio/stream
+remover jumped back to the main menu and started a download.
+
+| Area | Problem | Effect |
+|---|---|---|
+| Telegram transfer | `download_media` keeps one `upload.getFile` request in flight | Throughput capped by a single round trip; a large file looked stalled |
+| Progress text | No speed, and the ETA printed raw seconds | `ETA 2461s` told the user nothing useful |
+| Progress card | The hint was added by both `render_queue` and the panel renderer | The same sentence appeared twice in one message |
+| Progress card | The waiting loop and the bulk ticker each repainted on their own schedule | Up to twice the configured rate of edits to one message — the flood-wait class of bug seen before |
+| Custom Streams | The handler downloaded the file before deciding what the tap needed | Choosing tracks started a transfer, and the progress panel replaced the submenu, so it looked like a jump to the main menu |
+| Custom Streams | The selection was re-rendered as a bare one-line sentence | The chosen tracks were invisible, and the screen lost its context |
+| Apply | `_promote_item` cleared `st.streams` when the transfer finished | The selection was resolved *after* the download, so "Apply" could answer "you cannot remove every stream" and never run |
+| Apply | The panel repainted the main menu over an open submenu | The user lost their place mid-operation |
+
+The fix:
+
+- `app/services/telegram_download.py` splits a document into request-aligned
+  ranges and reads them concurrently, pre-allocating the file and writing each
+  chunk at its offset. Any failure — including a short or wrong-sized result —
+  falls back to the ordinary single-stream `download_media`, so the fast path
+  can only ever help. `TELEGRAM_DOWNLOAD_PARTS` (default 4) and
+  `TELEGRAM_PARTS_MIN_MB` (default 24) control it.
+- `QueueItem.advance()` measures the speed over the last interval and smooths
+  it; the progress line shows `bar · percent · current / total` and
+  `speed · ETA`, with the ETA in minutes (`41m`, `1h 05m`).
+- One shared timestamp throttles the progress repaint to `PROGRESS_INTERVAL`, and
+  an edit is skipped when the rendered text has not changed.
+- The stream screens resolve the track list from the header first; only the
+  operations that rewrite the file download it. While a transfer runs with a
+  submenu open, the card offers Cancel instead of the main menu.
+- The custom-selection screen is a real screen: every track is listed, taps are
+  marked, the count is shown, and the selection is captured before the transfer
+  starts.
+
+`tests/test_telegram_speed.py` and `tests/test_stream_selection_ux.py` pin all
+of it, including a byte-for-byte reassembly check of the ranged downloader and a
+real FFmpeg run of the custom removal.
 
 ## Live verification with the supplied environment
 

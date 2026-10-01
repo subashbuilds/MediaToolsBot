@@ -150,6 +150,8 @@ def make_bot(tmp_path, client, max_parallel=2):
         max_download_mb=16,
         max_parallel_downloads=max_parallel,
         progress_interval=0.5,
+        telegram_parts=4,
+        telegram_parts_min_mb=0,
         session_timeout=3600,
         sudo_users=frozenset(),
         allowed_users=frozenset(),
@@ -365,6 +367,8 @@ def test_promote_item_does_not_replace_active_file_while_busy(tmp_path):
     class Dummy:
         status = "done"
         display_name = "new.mkv"
+        streams: list = []
+        probe_data = None
 
     new_file = tmp_path / "new.mkv"
     new_file.write_bytes(b"new")
