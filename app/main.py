@@ -226,6 +226,10 @@ class UserState:
     # The single interactive "card" message: always the newest bot message.
     card_message_id: int | None = None
     card_chat_id: int | None = None
+    # True once a job finished and its result (an upload, a direct link) has
+    # been handed to the user. Nothing is running any more and the files/links
+    # that are left are the deliverable, so Cancel must not throw them away.
+    delivered: bool = False
 
     @property
     def busy(self) -> bool:
@@ -564,6 +568,7 @@ class MediaToolsBot:
         st = self.state(uid)
         st.cancel_event = asyncio.Event()
         st.task = asyncio.current_task()
+        st.delivered = False
         st.operation = label
         st.progress_current = 0
         st.progress_total = 0
@@ -1227,6 +1232,7 @@ class MediaToolsBot:
         st.last_panel_text = None
         st.last_panel_at = 0.0
         st.queue_cancel.clear()
+        st.delivered = False
         # Cancel sets this flag and nothing ever cleared it again, so every
         # later action short-circuited in await_input and answered "I have no
         # file or link to work on" for a file the user had just sent. A new
@@ -2525,10 +2531,21 @@ class MediaToolsBot:
 
         Metadata normally comes from the header read that happened when the
         input arrived, so opening Stream Remover/Extractor never transfers the
-        media. The full file is only fetched when no header could be read, and
-        even then the transfer runs with the usual progress.
+        media and never waits: ``_resolve_streams`` returns straight away. When
+        that read is still in flight the card says so before the wait starts -
+        otherwise the menu simply did not appear for a second or two and the
+        tap looked ignored. The full file is only fetched when no header could
+        be read, and even then the transfer runs with the usual progress.
         """
         st = self.state(uid)
+        if not st.streams and any(not t.done() for t in st.probe_tasks):
+            await self.render_card(
+                chat_id, uid,
+                "\U0001F50E <b>Getting track information\u2026</b>\n\n"
+                "<i>Reading the container header so the track list can be shown. "
+                "This does not download the whole file.</i>",
+                buttons=cancel_menu(),
+            )
         streams = await self._resolve_streams(uid)
         if streams:
             return streams
@@ -3065,6 +3082,10 @@ class MediaToolsBot:
             buttons=[[Button.inline("\u2B05\uFE0F Back", b"menu:back")]],
             parse_mode="html", link_preview=True, source=source,
         )
+        # The link lives on the card itself, so this is a delivered result too:
+        # a later Cancel must leave the card - and the file behind the link -
+        # alone instead of repainting it with the start screen.
+        self.state(uid).delivered = True
         # Expiry is handled by _direct_cleanup_loop, which also survives a bot
         # restart. Spawning one sleeping task per link used to leak thousands of
         # tasks for an active deployment.
@@ -3435,6 +3456,11 @@ class MediaToolsBot:
                         lines.append(f"  {esc(link)}")
             await self.safe_edit(status, "\n".join(lines), buttons=None, parse_mode="html", link_preview=False)
             await self.stop_timeout(uid)
+            await self._finish_delivery(
+                chat_id, uid, st,
+                "✅ <b>GoFile upload complete</b>\n\n"
+                "<i>The download link is in the message above. Temporary files were cleaned up.</i>",
+            )
             self.cleanup_user_files(uid)
             self._reset_session(st)
         except asyncio.CancelledError:
@@ -3507,6 +3533,11 @@ class MediaToolsBot:
                 summary += f"\n<i>{skipped} file(s) were no longer available and were skipped.</i>"
             await self.safe_edit(status, summary, buttons=None, parse_mode="html")
             await self.stop_timeout(uid)
+            await self._finish_delivery(
+                chat_id, uid, st,
+                "✅ <b>Telegram upload complete</b>\n\n"
+                "<i>The file is in the message above. Temporary files were cleaned up.</i>",
+            )
             self.cleanup_user_files(uid)
             self._reset_session(st)
         except asyncio.CancelledError:
@@ -3536,6 +3567,32 @@ class MediaToolsBot:
         st.queue.drop_finished()
         st.pending = None
         st.view = "menu"
+
+    async def _finish_delivery(self, chat_id: int, uid: int, st: UserState, note: str) -> None:
+        """Retire a finished result and clear whatever screen it was launched from.
+
+        An upload posts its result as a *new* message, so the screen the user
+        was last looking at - the rename prompt, the destination picker - stayed
+        on top of it with all its buttons long after it had stopped meaning
+        anything. Its Cancel then removed the file that had just been delivered.
+
+        Two things happen here: the result stops being the session's *status*
+        message, so neither a later Cancel nor the next job can delete it, and
+        the card is replaced with a short "done" note. The card is only edited,
+        never re-sent, so nothing new lands in the chat.
+        """
+        st.status_message_id = None
+        st.status_chat_id = None
+        st.delivered = True
+        card = await self._current_card(st, chat_id)
+        if card is None:
+            return
+        await self.safe_edit(
+            card,
+            f"{note}\n\n<i>Send a new file or link to start another job.</i>",
+            buttons=[[Button.inline("\U0001F3E0 Start", b"start:home")]],
+            parse_mode="html", link_preview=False,
+        )
 
     async def execute(self, chat_id, uid, label, func, upload=False, set_source=True, ffmpeg=True):
         """Run a blocking media job in a thread with live progress.
@@ -3821,6 +3878,19 @@ class MediaToolsBot:
 
     async def cancel(self, uid, chat_id, source_message=None, admin: bool = False):
         st = self.state(uid)
+        if st.delivered and not st.busy and not admin:
+            # Nothing is running and the last job was already handed over: its
+            # link message and its files *are* the result. Deleting the status
+            # message and force-cleaning the directory here destroyed exactly
+            # what the user had just been given, which is how a leftover Cancel
+            # button on a finished screen could wipe a completed upload.
+            st.delivered = False
+            text = "✅ Nothing to cancel — your file was already delivered."
+            if source_message is not None and hasattr(source_message, "answer"):
+                await self.answer(source_message, text, alert=True)
+            else:
+                await self.answer_event(chat_id, text)
+            return
         was_busy = st.busy
         st.cancel_event.set()
         st.pending = None

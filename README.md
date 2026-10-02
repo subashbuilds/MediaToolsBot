@@ -189,6 +189,21 @@ Upload
 
 This avoids the previous double `Rename / Skip` prompt.
 
+**The prompt never outlives the job.** An upload posts its result — link, size,
+file name — as its own message, so the rename screen used to stay on top of it
+with its `Cancel` button long after the rename had been applied and the upload
+had finished. As soon as a delivery succeeds the card is replaced with a short
+done note (edited in place, never re-sent), so there is no stale prompt left to
+press:
+
+```text
+✅ GoFile upload complete
+
+The download link is in the message above. Temporary files were cleaned up.
+
+[🏠 Start]
+```
+
 ### 🔗 Direct / Stream Link
 
 The bot includes a small HTTP server for locally stored files.
@@ -356,6 +371,23 @@ What can be answered **without downloading the media**:
 | Stream Remover / Extractor track list | No — read from the container header |
 | Everything else (trim, convert, merge, upload, extract, …) | Yes — downloaded on tap, with progress |
 
+The track menus open **immediately** when the header has already been read —
+that is the normal case, because the probe starts the moment the file arrives.
+When the read is still in flight the card says so straight away instead of
+staying blank:
+
+```text
+🔎 Getting track information…
+
+Reading the container header so the track list can be shown. This does not
+download the whole file.
+
+[Cancel Process]
+```
+
+The selection menu replaces that state as soon as the metadata lands, so a tap
+on Stream Remover or Stream Extractor always gives visible feedback.
+
 For an `http(s)` link the header is read over HTTP by FFprobe. Telegram cannot
 probe a document remotely, so the first few MiB are fetched instead — enough for
 the container header, never the whole file. That prefix is deleted immediately.
@@ -405,6 +437,13 @@ A user's Cancel action:
 9. Returns the user to the dashboard.
 
 A cancelled job does not leave a stale `Cancel Process` message behind.
+
+**Cancel never touches a delivered result.** Once a job has finished, its link
+message and its output files are the deliverable — so `Cancel` does not delete
+them. The result stops being the session's *status* message (nothing deletes it
+later), the output files are left alone, and the bot answers
+"Nothing to cancel — your file was already delivered." A real cancellation is
+unaffected: it still stops the running job and removes its temporary files.
 
 Cancelling stops the running work and drops the pending workflow, but it never
 poisons the rest of the session: sending a new file afterwards starts a clean

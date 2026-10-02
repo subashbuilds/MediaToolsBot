@@ -8,7 +8,7 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-210 passed, 3 skipped
+216 passed, 3 skipped
 
 MEDIABOT_LIVE=1 pytest -q tests/test_live_integrations.py
 3 passed
@@ -423,3 +423,38 @@ them passes vacuously.
 
 A multi-gigabyte Telegram transfer against a real datacenter (needs a real user
 account, not the bot token) and live Railway/Render ingress.
+
+---
+
+## Post-delivery and track-menu fixes (user report, Oct 2)
+
+Three symptoms were reported together with a screenshot of one session:
+rename → FFmpeg → Telegram copy → GoFile link, all successful, with the
+"✏️ Rename file / Send the new filename…" card and its `Cancel` button still on
+screen afterwards.
+
+### Bugs found and fixed
+
+| # | Bug | Impact | Fix |
+|---|---|---|---|
+| 6 | The prompt screen the upload was launched from was never touched on success. An upload posts its result as a **new** message, so the rename prompt stayed on top of the finished link with all its buttons | Confusing dead-end: the user is asked for a filename they already sent, and the only button left is a destructive Cancel | `app/main.py` — `_finish_delivery` replaces the card with a short done note (edit in place, never re-sent) once an upload succeeds |
+| 7 | `cancel()` deleted whatever `status_message_id` pointed at and force-cleaned the user's directory. After a successful upload that pointer is the **finished GoFile result** | Pressing Cancel on the leftover prompt destroyed the link message the user had just been given, and its output files | `app/main.py` — a successful delivery stops tracking its result as the session's status message and sets `UserState.delivered`; `cancel()` honours that flag, keeps the result, and answers "Nothing to cancel". A real cancellation is unchanged (revert-tested) |
+| 8 | Stream Remover / Extractor waited silently for the header probe (up to 90 s in `_wait_for_metadata`) with nothing on screen | A tap looked like the bot had ignored it | `app/main.py` — `_streams_for_menu` renders "🔎 Getting track information…" before the wait when a probe is still running. When the metadata is already known the menu appears immediately, as before |
+
+Bug 7 is also a direct-link path: `run_direct` marks the session delivered so a
+later Cancel cannot repaint the card that holds the link.
+
+### Regression tests — `tests/test_delivery_and_stream_ux.py` (6 tests)
+
+| Test | Bug |
+|---|---|
+| `test_rename_prompt_is_replaced_after_the_upload_succeeds` | 6 |
+| `test_cancel_after_delivery_keeps_the_link_and_the_files` | 7 |
+| `test_cancel_still_cleans_up_while_a_job_is_running` | 7 (guards the fix against over-reach) |
+| `test_cancel_before_a_delivery_is_unaffected` | 7 (guards the fix against over-reach) |
+| `test_stream_menu_appears_immediately_when_metadata_is_known` | 8 (guards the fix against over-reach) |
+| `test_stream_menu_shows_a_working_state_while_the_probe_runs` | 8 |
+
+All three bugs were reproduced against the unfixed source before the change, and
+reverting each fix makes exactly its matching test(s) fail — 3 of 6 fail when all
+three fixes are reverted, 1 when only the `cancel` guard is reverted.
