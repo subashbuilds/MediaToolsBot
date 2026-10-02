@@ -14,6 +14,9 @@ FAILED = "failed"
 
 _ids = itertools.count(1)
 MAX_VISIBLE_ITEMS = 12
+# A transfer that has not delivered a byte for this long is reported as
+# stalled rather than left looking like a healthy 0% bar.
+STALL_AFTER = 45.0
 
 
 @dataclass
@@ -109,6 +112,30 @@ class QueueItem:
         return max(0.0, (self.total - self.current) / speed)
 
     @property
+    def elapsed(self) -> float:
+        """Seconds this transfer has been running."""
+        return max(0.0, time.monotonic() - self.started_at)
+
+    @property
+    def idle_for(self) -> float:
+        """Seconds since the transfer last delivered bytes.
+
+        The download panel used to repaint only when the text changed, and a
+        transfer that is not moving produces identical text. The card then
+        stayed frozen on its first frame for as long as the wait lasted, which
+        is indistinguishable from a dead bot. This is what turns that silence
+        into an explicit "no data for ..." line.
+        """
+        if self.status != DOWNLOADING:
+            return 0.0
+        mark = self._last_at if self._last_at is not None else self.started_at
+        return max(0.0, time.monotonic() - mark)
+
+    @property
+    def stalled(self) -> bool:
+        return self.status == DOWNLOADING and self.idle_for >= STALL_AFTER
+
+    @property
     def display_name(self) -> str:
         if self.label:
             return self.label
@@ -190,6 +217,11 @@ class DownloadQueue:
             return None
         item.status = DOWNLOADING
         item.started_at = time.monotonic()
+        # The size is already known for a queued input, so the first frame can
+        # say "0 B / 2.53 GiB". Waiting for the first byte to arrive left the
+        # bar with no total and nothing for the user to judge the wait by.
+        if not item.total:
+            item.total = int(item.expected_size or 0)
         self.active += 1
         return item
 
@@ -251,6 +283,11 @@ def _item_line(item: QueueItem) -> str:
             line += f"\n    ⚡ {format_bytes_short(item.speed)}/s · ⏳ {format_eta(item.eta)} left"
         elif item.eta is not None:
             line += f"\n    ⏳ {format_eta(item.eta)} left"
+        # How long this has been running, always. It changes on every repaint,
+        # so the card keeps moving even while no bytes arrive.
+        line += f"\n    ⏱ {format_eta(item.elapsed)} elapsed"
+        if item.stalled:
+            line += f" · ⚠️ no data for {format_eta(item.idle_for)}"
         return f"⬇️ <b>{name}</b>\n{line}"
     return f"⏳ <b>{name}</b> — ready to download"
 

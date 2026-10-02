@@ -182,6 +182,13 @@ async def download_media_multipart(
                 parts=parts, progress=progress, cancel_event=cancel_event,
             )
         except asyncio.CancelledError:
+            # The ranged downloader pre-allocates the whole file up front, so a
+            # cancelled transfer leaves a near-full-size partial file behind.
+            # Nothing else removes it - the queue only unlinks ``item.path``,
+            # which is never assigned on a cancelled transfer - and repeated
+            # cancels would silently eat the disk.
+            with contextlib.suppress(OSError):
+                dest.unlink()
             raise
         except MultipartFailed as exc:
             log.info("ranged download failed (%s); using a single stream", exc)

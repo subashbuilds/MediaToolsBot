@@ -46,7 +46,9 @@ def test_start_does_not_open_media_menu_and_exposes_status_stats():
 
 def test_merge_session_is_seeded_from_current_source_and_snapshotted():
     source = Path("app/main.py").read_text()
-    assert "base = self.source_media(st)" in source
+    # ``_require_input`` fetches the queued input if the merge starts before it
+    # has been transferred, so the merge is never seeded from nothing.
+    assert "base = await self._require_input(chat_id, uid)" in source
     assert "st.merge_inputs = [base.resolve()]" in source
     assert "candidates = list(st.merge_inputs)" in source
     assert "inputs: list[Path] = []" in source

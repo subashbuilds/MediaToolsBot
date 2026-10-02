@@ -159,6 +159,9 @@ def make_bot(tmp_path, client, max_parallel=2):
         direct_link_ttl=3600,
         telegraph_access_token=None,
         reactions_enabled=False,
+        # Present so upload paths that read the global GoFile token work
+        # against this fixture instead of raising AttributeError.
+        gofile_api_token=None,
     )
     cfg.download_dir.mkdir(parents=True, exist_ok=True)
     cfg.work_dir.mkdir(parents=True, exist_ok=True)

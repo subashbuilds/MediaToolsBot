@@ -163,8 +163,15 @@ async def download_url(
     _validate_url(url, allow_private)
     timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
     headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; MediaToolsBot/3.0; +https://telegram.org)",
+        # A browser-shaped User-Agent. The previous bot-identifying string was
+        # rejected outright by several hosts (and by Cloudflare in front of
+        # them), which surfaced as "Download failed" for perfectly valid links.
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        ),
         "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
     }
     last_error: Exception | None = None
     for attempt in range(1, max(1, attempts) + 1):
@@ -191,6 +198,15 @@ async def _download_once(url, dest_dir, progress, cancel_event, limit, timeout, 
             if r.url:
                 _validate_url(str(r.url), allow_private)
             r.raise_for_status()
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            # A link that points at a web page rather than the file downloads
+            # an .html document that every later action then fails on. Say so
+            # instead of handing back a "media file" full of markup.
+            if ctype in {"text/html", "application/xhtml+xml"}:
+                raise DownloadError(
+                    "That link returns a web page, not a media file. "
+                    "Open it and copy the direct download link for the file."
+                )
             name = _filename_from_response(r, url)
             out = unique_path(dest_dir, name)
             declared = r.headers.get("Content-Length")

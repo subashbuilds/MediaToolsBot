@@ -8,7 +8,7 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-181 passed
+210 passed, 3 skipped
 
 MEDIABOT_LIVE=1 pytest -q tests/test_live_integrations.py
 3 passed
@@ -59,6 +59,9 @@ PASS (only the intentional `import cryptg` availability probe)
   `MessageNotModifiedError` on an unchanged edit and returns `None` for a deleted message, covering
   re-render behaviour, card recovery after deletion, mid-download action handling, menu placement,
   user-keyed status state, stale-button feedback, and a full scripted user journey
+- **The four bugs reported from the live bot** (`tests/test_user_reported_bugs.py`): the GoFile
+  upload crash, URL/link-post routing, the action menu during a transfer, and Direct/Stream Link —
+  each driven through the real router, renderer and callback path
 
 ### Why the first pass missed the interface bugs
 
@@ -235,6 +238,51 @@ The fix:
 of it, including a byte-for-byte reassembly check of the ranged downloader and a
 real FFmpeg run of the custom removal.
 
+## Bugs fixed in the reported-symptoms pass
+
+Four defects were reported from the live bot with screenshots. Each one is
+reproduced by a test that fails against the pre-fix code.
+
+| Area | Problem | Effect |
+|---|---|---|
+| GoFile upload | `run_gofile` called `new_status_message(chat_id, uid, text, buttons=...)`, so `uid` landed in `text` and the body landed in `buttons` | `TypeError: MediaToolsBot.new_status_message() got multiple values for argument 'buttons'` — **every GoFile upload died the moment the destination was chosen** |
+| Message routing | `event.message.media` was the "is this media?" test | Telegram sets it for the invisible **WebPage preview** on a text message containing a link, so a link was queued as a phantom `telegram_<id>.bin`. Every action then failed on a message that had no file, which is why **no URL functionality worked at all** |
+| Link detection | Only `raw_text` was searched for a URL | Posts that hide the link behind anchor text ("Click Here") were invisible to the bot, so a message carrying two working links was treated as empty text |
+| Direct/Stream Link | `run_direct` awaited the download and then answered "Send or download a media file first" whenever `st.path` was not ready | Tapping **Make Direct/Stream Link** on a file the bot had already queued answered "send a file again" |
+| Real errors | The same blanket message was rendered *after* `await_input` had already reported the failure | A download that failed with a real reason was overwritten with "you never sent anything" |
+| Progress card | The action menu stayed on screen underneath the progress bar | The screenshots showed the full menu under the bar; it read as though the tap had been ignored, and none of those actions work until the transfer finishes anyway |
+| Upload | `choose_upload`/`run_gofile`/`upload_telegram` looked only at already-downloaded files | Uploading a freshly sent link answered "No current file to upload" — the same on-demand-download gap the transfer refactor introduced |
+| URL Uploader | Asked for another link even when one was already queued | Another dead end for the reported "URL does nothing" symptom |
+| Direct/Stream Link | `PUBLIC_BASE_URL` was checked *after* fetching the whole file | A multi-gigabyte transfer ran before the bot could admit it cannot build a link at all |
+
+The fix:
+
+- `new_status_message` is called with `uid=` as a keyword everywhere; the
+  positional call site is gone.
+- `is_media_message()` decides media by looking for an actual downloadable
+  part, and `message_urls()` reads links from the text *and* from hidden
+  `text_url` entities. `receive_media()` refuses a link-only message as a
+  second line of defence.
+- `_require_input()` is the single way an action obtains its media: it starts
+  the queued transfer, and on failure it lets the real error stand instead of
+  claiming no file was ever sent.
+- The progress card shows only Cancel while bytes are moving; the action menu
+  returns once the file is on disk.
+- Upload and URL-Uploader paths fetch a queued-but-untransferred input rather
+  than reporting it missing.
+- `run_direct` checks `PUBLIC_BASE_URL` first, so no transfer is spent on a
+  link the server cannot serve.
+- The URL downloader sends a browser-shaped `User-Agent` (the old
+  bot-identifying one was rejected by several hosts and by Cloudflare in front
+  of them) and rejects a `text/html` response as "that link is a web page, not
+  a media file" instead of downloading a page as if it were media.
+
+`tests/test_user_reported_bugs.py` pins all of it. Each fix was verified by
+reverting it and confirming the matching test fails with the production
+symptom — the GoFile revert raises the exact reported `TypeError`, and the
+routing revert produces the `telegram_2.bin` phantom file and the
+"This message no longer contains a file" failure seen in the logs.
+
 ## Live verification with the supplied environment
 
 Run with the values from `.env` (names only in this report; no secret is
@@ -269,3 +317,109 @@ user account, not a bot token) and live Railway/Render ingress. The SSRF guard
 is covered by tests that assert the block; the local-HTTP tests opt in
 explicitly with `allow_private=True`, the same escape hatch
 `ALLOW_PRIVATE_DOWNLOADS` provides in production.
+
+## Frozen download progress (reported symptom)
+
+> "After clicking the audio track I want to remove it just stuck there not
+> showing anything but after some hours I pressed it shows where do you want to
+> upload — like the progress is not showing."
+
+**Reproduced.** A 2.53 GB Telegram document, opened through *Custom Streams*,
+one track marked, **Apply** pressed. The download screen was painted exactly
+**once** and then nothing was sent to Telegram for the entire wait:
+
+```text
+📥 Downloads
+Queued: 1   Ready: 0   Downloading: 1
+⬇️ movie.mkv
+    ░░░░░░░░░░░░░░   0.0% · 0 B downloaded
+```
+
+and `await_input` is prepared to wait up to `DOWNLOAD_WAIT` (4 hours) before it
+says anything. That is exactly "stuck there not showing anything".
+
+**Cause.** `_render_panel` skipped any repaint whose text was identical to the
+last one, which is a sensible way to avoid pointless edits — but a transfer
+that is not producing bytes produces identical text, so the first frame was
+also the last. On top of that `claim()` never copied the known
+`expected_size` onto the item, so the bar had no total to print until the first
+chunk arrived, and the shared repaint throttle could swallow the very first
+download frame when something else had repainted moments earlier — leaving the
+submenu the user tapped still on screen with no sign anything had started.
+
+**Fixed.**
+
+| Change | File |
+|---|---|
+| The running item now always prints `⏱ Ns elapsed`, so the panel text changes on every repaint and the card keeps moving while no bytes arrive | `app/services/bulk.py` |
+| `⚠️ no data for …` after 45 s without a byte, so a stall is stated instead of inferred from a frozen bar | `app/services/bulk.py` |
+| `claim()` seeds `total` from `expected_size`: the first frame reads `0 B / 2.53 GiB` | `app/services/bulk.py` |
+| `_render_panel` no longer suppresses an identical repaint while a transfer is running; the repaint *rate* is still bounded by `_panel_due` | `app/main.py` |
+| `await_input` clears the repaint throttle before its first pass, so the action the user just tapped is always on screen at once | `app/main.py` |
+
+**Regression tests** — `tests/test_progress_visibility.py` (5 tests):
+
+- `test_pressing_apply_repaints_the_screen_the_user_is_on` — Apply paints the
+  download screen onto the card the user was looking at, not a new message.
+- `test_a_stalled_transfer_keeps_repainting` — a transfer with zero incoming
+  bytes keeps producing frames whose elapsed counter advances. Removing the
+  elapsed line makes this fail.
+- `test_a_stalled_transfer_is_called_out` — ten minutes without a byte renders
+  `⚠️ no data for 10m`.
+- `test_claiming_a_transfer_knows_its_size_before_the_first_byte` — the total
+  is known the moment the item is claimed.
+- `test_apply_never_leaves_the_submenu_on_screen` — the reported symptom stated
+  as an assertion: the Custom Streams screen is gone from the visible card.
+
+## Full-system audit
+
+Every module was read end to end (`app/main.py`, all of `app/services/`,
+`app/storage/`, `app/ui/`, `app/utils/`, `app/config.py`) and the behaviour was
+then exercised rather than assumed. Beyond reading, three sweeps were run:
+
+- **every button the bot can emit** (113 callback payloads from
+  `app/ui/keyboards.py` plus the ones built inline) was driven through
+  `callback_router` to prove none of them is a dead button;
+- the **direct-link server** was started and hit over real HTTP: full body,
+  `Range: bytes=0-9` → `206`, unknown token → `404`, a file outside the served
+  roots → `404`, an expired link → `410`, `/health` → JSON;
+- **every FFmpeg entry point** (remux, remove-audio, trim with and without an
+  end, optimize, mp4, mkv, video→audio, sample, split, screenshots, manual
+  shot, stream extraction, merge, audio convert, audio filter) was run against
+  a real generated MKV with the real binary.
+
+### Bugs found and fixed
+
+| # | Bug | Impact | Fix |
+|---|---|---|---|
+| 1 | `cancel_event` was set by Cancel and never cleared again | **Severe.** Every action afterwards short-circuited in `await_input` and answered "I have no file or link to work on" for a file the user had just sent — the bot was dead for the rest of the 6-hour session | `app/main.py` — `enqueue_input` installs a fresh `asyncio.Event`, so a new input is a new workflow |
+| 2 | A cancelled ranged Telegram download left its pre-allocated partial file on disk | The file is allocated at full size up front, so repeated cancels silently ate the volume | `app/services/telegram_download.py` — the `CancelledError` branch now unlinks `dest` before re-raising |
+| 3 | **Stream Extractor → Custom Streams ran a remux.** The screen says "tap every track you want to **extract**"; Apply deleted exactly those tracks and returned the file holding the ones the user had *not* tapped | The whole Custom Streams half of Stream Extractor did the opposite of what it said | `app/main.py` — new `_extract_custom_streams`; `streamapply` now branches on `st.view_mode` |
+| 4 | GoFile answered HTTP 429 (rate limit) and the retry loop treated every `HTTP 4…` as permanent | A single rate-limited response failed the whole multi-gigabyte upload with no retry | `app/services/gofile.py` — 408 and 429 are retried; other 4xx still fail immediately |
+| 5 | `_sweep_orphans` called the threaded helper and then repeated the entire sweep inline | Directories were walked twice, and the second pass ran `shutil.rmtree` on the event loop, blocking every user's messages at start-up | `app/main.py` — the duplicated body is gone |
+
+Bug 1 and bug 3 were both confirmed by execution before the fix and are covered
+by tests that fail when the fix is reverted.
+
+### Regression tests — `tests/test_audit_fixes.py` (10 tests)
+
+| Test | Bug |
+|---|---|
+| `test_an_action_still_works_after_the_user_pressed_cancel` | 1 |
+| `test_sending_a_new_input_clears_a_stale_cancel_flag` | 1 |
+| `test_cancelling_a_ranged_download_removes_the_partial_file` | 2 |
+| `test_extract_mode_extracts_the_marked_tracks` | 3 |
+| `test_remove_mode_still_remuxes` | 3 (guards the fix against over-reach) |
+| `test_extract_mode_says_extract_on_the_screen` | 3 |
+| `test_gofile_rate_limit_is_retried` | 4 |
+| `test_gofile_bad_token_is_not_retried` | 4 (guards the fix against over-reach) |
+| `test_orphan_sweep_runs_once` | 5 |
+| `test_orphan_sweep_keeps_a_user_with_live_downloads` | 5 (guards the fix against over-reach) |
+
+Reverting all five fixes makes exactly the six matching tests fail, so none of
+them passes vacuously.
+
+### Still not verifiable from here
+
+A multi-gigabyte Telegram transfer against a real datacenter (needs a real user
+account, not the bot token) and live Railway/Render ingress.

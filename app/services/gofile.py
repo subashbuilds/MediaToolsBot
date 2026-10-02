@@ -97,9 +97,14 @@ async def upload_gofile(
                 break
             await asyncio.sleep(min(8, 1.5 * attempt))
         except RuntimeError as exc:
-            # 4xx responses are deterministic (bad token, folder missing) and
-            # are surfaced immediately rather than retried pointlessly.
-            if "HTTP 4" in str(exc):
+            # Most 4xx responses are deterministic (bad token, folder missing)
+            # and are surfaced immediately rather than retried pointlessly.
+            # 408 and 429 are the server asking us to slow down or try again
+            # later, and GoFile rate-limits bursts, so those must be retried -
+            # the blanket "HTTP 4" test failed every rate-limited upload.
+            message = str(exc)
+            permanent = "HTTP 4" in message and not any(f"HTTP {code}" in message for code in (408, 429))
+            if permanent:
                 raise
             last = exc
             if attempt >= max(1, attempts):

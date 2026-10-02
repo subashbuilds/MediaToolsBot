@@ -12,9 +12,15 @@ from app.config import _detect_public_base_url
 
 
 def test_plain_url_is_recognized_before_telegram_webpage_media():
-    source = Path("app/main.py").read_text()
-    assert 're.match(r"^https?://\\S+$", text, re.I)' in source
-    assert source.index('elif re.match(r"^https?://\\S+$", text, re.I):') < source.index('elif event.message.media:')
+    """A URL must be read as a URL even when Telegram attaches a preview.
+
+    ``message.media`` is set for the invisible WebPage preview on a text
+    message, so using it as the "is this media?" test made the bot queue a
+    phantom ``telegram_<id>.bin`` instead of the link the user sent.
+    """
+    main_mod = __import__("app.main", fromlist=["main"])
+    assert main_mod.is_media_message(_message_with_preview()) is False
+    assert main_mod.is_media_message(_message_with_file()) is True
 
 
 def test_public_base_url_auto_detection(monkeypatch):
@@ -124,8 +130,43 @@ def test_cancel_clears_pending_and_keyboard():
 
 
 def test_pending_workflows_win_over_generic_url_handler():
+    """An active prompt (trim, rename, URL uploader, ...) owns the next message."""
     source = Path("app/main.py").read_text()
-    pending = 'elif self.state(uid).pending:'
-    generic = 'elif re.match(r"^https?://\\S+$", text, re.I):'
+    pending = "elif pending:"
+    generic = "elif links:"
     assert pending in source
     assert source.index(pending) < source.index(generic)
+
+
+def _message_with_preview():
+    """A text message that Telegram decorated with a webpage preview."""
+    return types.SimpleNamespace(
+        raw_text="Sardar 2 (2026) 1.6GB ESub.mkv\nClick Here",
+        text="Sardar 2 (2026) 1.6GB ESub.mkv\nClick Here",
+        media=object(), file=None,
+        photo=None, video=None, audio=None, voice=None, video_note=None, document=None,
+        entities=[types.SimpleNamespace(url="https://cdn.example/fast.mkv")],
+    )
+
+
+def _message_with_file():
+    return types.SimpleNamespace(
+        raw_text="", text="", media=object(),
+        file=types.SimpleNamespace(name="movie.mkv", size=10),
+        photo=None, video=None, audio=None, voice=None, video_note=None,
+        document=object(), entities=None,
+    )
+
+
+def test_hidden_link_entities_are_extracted():
+    """A 'Click Here' link is a real download request, not an empty message."""
+    main_mod = __import__("app.main", fromlist=["main"])
+    assert main_mod.message_urls(_message_with_preview()) == ["https://cdn.example/fast.mkv"]
+    # A bare link in the text is still found, and not duplicated by entities.
+    plain = types.SimpleNamespace(
+        raw_text="https://cdn.example/a.mkv", text="https://cdn.example/a.mkv",
+        media=None, file=None,
+        photo=None, video=None, audio=None, voice=None, video_note=None, document=None,
+        entities=[types.SimpleNamespace(url="https://cdn.example/a.mkv")],
+    )
+    assert main_mod.message_urls(plain) == ["https://cdn.example/a.mkv"]

@@ -94,6 +94,46 @@ def extract_url(text: str) -> str | None:
     return match.group(0).rstrip(".,;:!?'\"»")
 
 
+def is_media_message(message) -> bool:
+    """True only when the message carries something that can be downloaded.
+
+    ``message.media`` is *not* that test: Telegram sets it for the invisible
+    WebPage preview that it attaches to a text message containing a link. The
+    bot used to treat such a message as media, queued a phantom
+    ``telegram_<id>.bin`` and then failed every action with "send a media file
+    first" - which is exactly what a link-only message deserves not to do.
+    """
+    if getattr(message, "file", None) is not None:
+        return True
+    return any(getattr(message, attr, None) is not None for attr in (
+        "document", "photo", "video", "audio", "voice", "video_note", "gif", "sticker",
+    ))
+
+
+def message_urls(message) -> list[str]:
+    """Every http(s) link in a message, hidden ones included.
+
+    Posts that advertise a download usually hide the URL behind anchor text
+    ("Click Here"), so it never appears in ``raw_text``. Reading only the plain
+    text made those links invisible and the bot answered "send a media file
+    first" for a message that carried two working links.
+    """
+    urls: list[str] = []
+
+    def add(value: str | None) -> None:
+        candidate = extract_url(value or "")
+        if candidate and candidate not in urls:
+            urls.append(candidate)
+
+    add(getattr(message, "raw_text", "") or getattr(message, "text", ""))
+    for entity in getattr(message, "entities", None) or []:
+        add(getattr(entity, "url", None))
+    for button in getattr(message, "reply_markup", None) and getattr(message.reply_markup, "rows", []) or []:
+        for item in button:
+            add(getattr(item, "url", None))
+    return urls
+
+
 def guess_media_name(message, fallback: str) -> str:
     """Derive a sensible filename for an incoming Telegram message."""
     file = getattr(message, "file", None)
@@ -868,36 +908,38 @@ class MediaToolsBot:
         await self.register_user(event, uid)
         self.touch(uid)
         text = (event.raw_text or "").strip()
+        pending = self.state(uid).pending
+        # Telegram attaches an invisible WebPage preview to a text message that
+        # contains a link, so ``message.media`` alone cannot decide this. Only a
+        # message with a real file counts as media; everything else is text.
+        has_media = is_media_message(event.message)
+        links = message_urls(event.message)
         if text.startswith("/"):
             await self.handle_command(event, text)
-        elif self.state(uid).pending == "archive_collect" and event.message.media:
+        elif pending == "archive_collect" and has_media:
             await self.receive_archive_part(event)
-        elif self.state(uid).pending == "custom_thumbnail" and event.message.media:
+        elif pending == "custom_thumbnail" and has_media:
             await self.receive_custom_thumbnail(event)
-        elif self.state(uid).pending == "merge_collect" and event.message.media:
+        elif pending == "merge_collect" and has_media:
             # Media messages (including audio/document messages with captions)
             # must be routed to the merge collector before the generic pending
             # text handler.
             await self.receive_media(event)
-        elif self.state(uid).pending == "archive_collect" and re.match(r"^https?://\S+$", text, re.I):
-            await self.process_archive_part_url(event.chat_id, uid, text)
-        elif self.state(uid).pending == "merge_collect" and re.match(r"^https?://\S+$", text, re.I):
+        elif pending == "archive_collect" and links:
+            await self.process_archive_part_url(event.chat_id, uid, links[0])
+        elif pending == "merge_collect" and links:
             # Merge collection accepts both Telegram files and HTTP(S) URLs.
-            await self.process_merge_url(event.chat_id, uid, text)
-        elif self.state(uid).pending:
+            await self.process_merge_url(event.chat_id, uid, links[0])
+        elif pending:
             # Pending workflows (trim, URL uploader, archive, upload, etc.)
             # must receive the text before the generic URL handler.
             await self.handle_text(event, text)
-        elif re.match(r"^https?://\S+$", text, re.I):
-            # Telegram may attach a WebPage preview to a plain URL. Treat the
-            # URL as the actual input instead of passing the preview to
-            # download_media(), which can legitimately return None.
-            await self.process_url(event.chat_id, uid, text)
-        elif event.message.media:
+        elif has_media:
             await self.receive_media(event)
-        elif extract_url(text):
-            # A link embedded in a sentence is still a download request.
-            await self.process_url(event.chat_id, uid, extract_url(text))
+        elif links:
+            # A bare link, a link inside a sentence, or a link hidden behind
+            # anchor text are all download requests.
+            await self.process_url(event.chat_id, uid, links[0])
         elif text:
             await self.handle_text(event, text)
 
@@ -1037,8 +1079,9 @@ class MediaToolsBot:
 
         * an input is waiting for the user to pick something - the action menu
           plus whatever the header probe already knows about the file;
-        * a transfer is running - the real progress bar, with the familiar
-          buttons still in place so the user is never stuck;
+        * a transfer is running - the real progress bar with a Cancel button;
+          the action menu is withheld until the bytes are there, because a
+          menu under the bar read as "the tap was ignored";
         * the file is here - the normal per-file menu.
 
         ``fresh`` sends a brand new card. That is required for the very first
@@ -1064,8 +1107,12 @@ class MediaToolsBot:
                 if not self._panel_due(st, fresh):
                     return None
                 text = render_queue(st.queue, None, bulk=False)
-                buttons = cancel_menu() if st.submenu else main_menu()
-                return await self._render_panel(chat_id, uid, st, text, buttons)
+                # Only Cancel while bytes are moving. The action menu used to
+                # stay on screen under the progress bar, which read as if the
+                # bot was ignoring the tap: the panel and the menu belong to
+                # the same card, and the menu's actions are unavailable until
+                # the transfer finishes anyway.
+                return await self._render_panel(chat_id, uid, st, text, cancel_menu())
             if st.path is not None:
                 return await self.show_file_menu(chat_id, uid, st.path, fresh=fresh)
             return await self.render_card(
@@ -1108,8 +1155,15 @@ class MediaToolsBot:
         return True
 
     async def _render_panel(self, chat_id, uid, st, text: str, buttons) -> None:
-        """Repaint the progress card, skipping edits that would change nothing."""
-        if text == st.last_panel_text and st.card_message_id:
+        """Repaint the progress card, skipping edits that would change nothing.
+
+        The dedupe is only safe while nothing is moving. During a transfer the
+        text is allowed to repeat, because the elapsed counter on it is what
+        tells the user the bot is still working; skipping the repeat is what
+        left the card frozen on its very first frame for the whole wait. The
+        repaint rate is already bounded by ``_panel_due``.
+        """
+        if text == st.last_panel_text and st.card_message_id and not st.queue.running():
             return None
         st.last_panel_text = text
         return await self.render_card(chat_id, uid, text, buttons=buttons)
@@ -1173,6 +1227,11 @@ class MediaToolsBot:
         st.last_panel_text = None
         st.last_panel_at = 0.0
         st.queue_cancel.clear()
+        # Cancel sets this flag and nothing ever cleared it again, so every
+        # later action short-circuited in await_input and answered "I have no
+        # file or link to work on" for a file the user had just sent. A new
+        # input is a new workflow, so it starts with a fresh cancel flag.
+        st.cancel_event = asyncio.Event()
         st.card_message_id = None
         st.card_chat_id = None
         # Drop the old card references too, otherwise render_card would edit
@@ -1468,6 +1527,17 @@ class MediaToolsBot:
     async def receive_media(self, event):
         uid = event.sender_id
         st = self.state(uid)
+        message = event.message
+        if not is_media_message(message):
+            # Belt and braces: a link-only message reaches here only through a
+            # race with a pending workflow. Queueing it as media produced a
+            # phantom file that no action could ever use.
+            links = message_urls(message)
+            if links:
+                await self.process_url(event.chat_id, uid, links[0])
+            else:
+                await event.reply("That message has no file in it. Send a media file or an http(s) link.")
+            return
         if st.pending == "merge_collect":
             await self.download_merge_input(event)
             return
@@ -1480,7 +1550,6 @@ class MediaToolsBot:
         if st.busy:
             await event.reply("⚠️ A process is already running. Press Cancel first.", buttons=cancel_menu())
             return
-        message = event.message
         name = guess_media_name(message, f"telegram_{getattr(message, 'id', 0)}.bin")
         file = getattr(message, "file", None)
         item = QueueItem(
@@ -1543,9 +1612,10 @@ class MediaToolsBot:
 
     async def run_archive(self, chat_id, uid, source=None):
         st = self.state(uid)
-        await self.await_input(chat_id, uid)
-        path = st.path
-        if not path or not path.exists() or not is_archive(path):
+        path = await self._require_input(chat_id, uid)
+        if path is None:
+            return
+        if not is_archive(path):
             await self.render_ui(chat_id, uid, "❌ Send an archive file first.", buttons=main_menu(), source=source)
             return
         st.archive_parts = [path.resolve()]
@@ -1818,7 +1888,8 @@ class MediaToolsBot:
             await self.apply_rename_and_continue(event.chat_id, uid, text)
             return
         if st.pending == "urlupload":
-            url = extract_url(text)
+            links = message_urls(getattr(event, "message", None)) if hasattr(event, "message") else []
+            url = (links or [extract_url(text)])[0]
             if url and re.match(r"^https?://", url, re.I):
                 await self.process_url(event.chat_id, uid, url)
             else:
@@ -1998,7 +2069,10 @@ class MediaToolsBot:
         if data == "menu:direct":
             await self.run_direct(event.chat_id, uid, source=event); return
         if data == "menu:urlupload":
-            if st.path and st.path.exists():
+            # A queued-but-not-yet-transferred input still counts: asking for
+            # another link while one was already sent is the "URL
+            # functionality does nothing" report.
+            if st.path and st.path.exists() or st.queue.has_work() or st.current_item is not None:
                 await self.render_ui(event.chat_id, uid, "📤 <b>URL/File Uploader</b>\n\nChoose where to upload the current file.", buttons=upload_menu(), parse_mode="html", source=event)
             else:
                 st.pending = "urlupload"
@@ -2161,14 +2235,22 @@ class MediaToolsBot:
             await self.stream_custom_menu(event.chat_id, uid, st.view_mode or "remove", source=event)
             return
         if data == "streamapply":
+            mode = st.view_mode or "remove"
             if not st.custom_remove:
-                await self.stream_custom_menu(event.chat_id, uid, st.view_mode or "remove", source=event)
+                await self.stream_custom_menu(event.chat_id, uid, mode, source=event)
                 await self.answer(event, "Select at least one track first.", alert=True)
                 return
             # Resolve the selection *before* the transfer: the track list belongs
             # to the input the user chose from, not to whatever the background
             # probe happens to have produced by the time it finishes.
             chosen = set(st.custom_remove)
+            if mode == "extract":
+                # Stream Extractor must pull the marked tracks out into their
+                # own files. Apply used to ignore the mode entirely and run a
+                # remux that kept everything the user had *not* tapped, so
+                # "extract this track" silently deleted it instead.
+                await self._extract_custom_streams(event.chat_id, uid, chosen)
+                return
             keep = [s.get("index") for s in st.streams if s.get("index") not in chosen]
             if not keep:
                 await self.answer(event, "That selection would leave no streams.", alert=True)
@@ -2178,9 +2260,6 @@ class MediaToolsBot:
             target = self.source_media(st)
             if not target:
                 await self.answer(event, "That file is not available any more.", alert=True)
-                return
-            if not keep:
-                await self.answer(event, "You cannot remove every stream.", alert=True)
                 return
             out = unique_path(self.cfg.work_dir / str(uid), f"{target.stem}.custom.mkv")
             await self.execute(event.chat_id, uid, "🧹 Removing custom streams", lambda: ffmpeg.remux(target, out, keep), upload=True, set_source=True); return
@@ -2501,6 +2580,51 @@ class MediaToolsBot:
         )
         return await self.render_ui(chat_id, uid, header, buttons=rows, source=source)
 
+    async def _extract_custom_streams(self, chat_id: int, uid: int, chosen: set[int]) -> None:
+        """Pull the Custom Streams selection out into one file per track.
+
+        This is the Stream Extractor half of the shared Custom Streams screen.
+        Apply used to run a remux regardless of the mode, so marking a track
+        to *extract* actually deleted it and handed back the file holding the
+        tracks the user had not tapped.
+        """
+        st = self.state(uid)
+        await self.await_input(chat_id, uid)
+        target = self.source_media(st)
+        if not target:
+            await self.render_card(chat_id, uid, "That file is not available any more.", buttons=main_menu())
+            return
+        wanted = [s for s in st.streams if s.get("index") in chosen]
+        if not wanted:
+            await self.render_card(chat_id, uid, "None of the selected tracks could be found.", buttons=main_menu())
+            return
+        outputs: list[Path] = []
+
+        def job(reporter=None) -> Path:
+            for stream in wanted:
+                index = stream.get("index")
+                ext = ffmpeg._stream_output_extension(stream)
+                out = unique_path(self.cfg.work_dir / str(uid), f"{target.stem}.stream{index}{ext}")
+                ffmpeg.extract_stream(target, out, index)
+                outputs.append(out)
+            return outputs[0]
+
+        await self.execute(
+            chat_id, uid, "🎵 Extracting selected streams",
+            self.make_ffmpeg_job(uid, job, target), upload=False,
+        )
+        if not outputs:
+            return
+        # Every extracted track has to be offered to the user, not just the first.
+        st.outputs = list(outputs)
+        st.path = outputs[0]
+        st.source_path = target
+        st.root_path = target
+        st.original_name = f"{target.stem} — {len(outputs)} stream(s)"
+        st.streams = []
+        st.view = "menu"
+        await self.choose_upload(chat_id, uid)
+
     async def stream_remux(self, chat_id, uid, keep):
         st = self.state(uid)
         if not keep:
@@ -2552,6 +2676,12 @@ class MediaToolsBot:
         if not st.queue.has_work():
             return None
         self._start_worker(uid)
+        # The action the user just tapped must be visible immediately. The
+        # shared repaint throttle can swallow the first download frame when
+        # something else repainted moments earlier, which left the submenu they
+        # pressed from on screen with no sign the transfer had begun.
+        st.last_panel_at = 0.0
+        st.last_panel_text = None
         # Yield once so the worker has claimed an item before the first repaint;
         # otherwise a fast transfer finishes without the user ever seeing it.
         await asyncio.sleep(0)
@@ -2581,6 +2711,34 @@ class MediaToolsBot:
                     )
                 return None
             await asyncio.sleep(interval)
+
+    async def _require_input(self, chat_id: int, uid: int) -> Path | None:
+        """Return the media for an action, explaining precisely what is missing.
+
+        ``await_input`` starts the queued transfer and renders either progress
+        or a download failure. Callers used to follow it with a blanket "send a
+        media file first", which overwrote the real error - so a failed URL or
+        an unreachable file was reported as "you never sent anything", which is
+        what the user saw when tapping Make Direct/Stream Link.
+        """
+        st = self.state(uid)
+        path = await self.await_input(chat_id, uid)
+        path = path or self.source_media(st)
+        if path and path.exists():
+            return path
+        # A failed item already has its explanation on screen; do not clobber it.
+        if st.queue.failed():
+            with contextlib.suppress(Exception):
+                await self._render_queue_failure(chat_id, uid)
+            return None
+        with contextlib.suppress(Exception):
+            await self.render_card(
+                chat_id, uid,
+                "📦 I have no file or link to work on.\n\n"
+                "Send a Telegram media file or an HTTP(S) link, then choose an action.",
+                buttons=main_menu(), parse_mode="html",
+            )
+        return None
 
     async def _render_queue_failure(self, chat_id: int, uid: int) -> None:
         """Explain a failed transfer instead of claiming no file was sent."""
@@ -2796,10 +2954,8 @@ class MediaToolsBot:
         if st.busy:
             await self.render_card(chat_id, uid, "⚠️ A process is already running for you. Press Cancel first.", buttons=cancel_menu())
             return
-        await self.await_input(chat_id, uid)
-        base = self.source_media(st)
-        if not base or not base.exists():
-            await self.render_card(chat_id, uid, "Send or download a media file first.", buttons=main_menu())
+        base = await self._require_input(chat_id, uid)
+        if base is None:
             return
         # Snapshot the first input immediately. Additional media messages are
         # appended by receive_media()/download_merge_input().
@@ -2875,22 +3031,25 @@ class MediaToolsBot:
             st.merge_inputs.clear()
 
     async def run_direct(self, chat_id, uid, source=None):
-        st = self.state(uid)
-        await self.await_input(chat_id, uid)
-        path = st.path
-        if not path or not path.exists():
-            await self.render_card(chat_id, uid, "📦 Send or download a media file first.", buttons=main_menu())
-            return
+        # Direct/stream links need the bytes on local disk, so this is where the
+        # queued transfer actually starts. It used to be a bare await_input()
+        # followed by "send a media file first", which reported a perfectly
+        # good input as missing whenever the transfer had not landed yet.
         if not self.cfg.public_base_url:
-            await self.client.send_message(
-                chat_id,
-                "I cannot safely invent a public URL for this server.\n\n"
+            # Checked before spending a multi-gigabyte download on a link the
+            # server cannot serve.
+            await self.render_card(
+                chat_id, uid,
+                "🔗 <b>Direct/Stream Link is not configured on this server.</b>\n\n"
                 "Set <code>PUBLIC_BASE_URL</code> to your public HTTPS origin. "
                 "Railway/Render domains are detected automatically when their "
                 "standard environment variable is available.\n\n"
                 "The service must expose <code>WEB_PORT</code> (default 8080) publicly.",
-                parse_mode="html",
+                buttons=main_menu(), parse_mode="html",
             )
+            return
+        path = await self._require_input(chat_id, uid)
+        if path is None:
             return
         self.db.purge_direct_links(int(time.time()))
         token = secrets.token_urlsafe(18)
@@ -3109,9 +3268,19 @@ class MediaToolsBot:
         if not st.path or not st.path.exists():
             files = [p for p in st.outputs if p.exists()] if st.outputs else []
             if not files:
+                # Nothing has been transferred yet, so this is where an upload
+                # of a freshly sent link/file has to start fetching it. Without
+                # this the answer was always "No current file to upload".
+                st.path = await self._require_input(chat_id, uid)
+                st = self.state(uid)
+                files = [p for p in st.outputs if p.exists()] if st.outputs else []
+            if not files and not (st.path and st.path.exists()):
+                if st.queue.failed():
+                    return
                 await self.render_ui(chat_id, uid, "❌ No current file to upload.", buttons=main_menu())
                 return
-            st.path = files[0]
+            if files and not (st.path and st.path.exists()):
+                st.path = files[0]
         # A fixed setting is used only when no explicit destination was chosen.
         if destination is None:
             mode = self.db.get_upload_mode(uid)
@@ -3231,14 +3400,25 @@ class MediaToolsBot:
             return
         files = self._upload_files(st)
         if not files:
-            await self.render_ui(chat_id, uid, "No current file(s) to upload.", buttons=main_menu())
+            # Reached when the destination is chosen before the transfer
+            # finished; fetch it now instead of claiming there is no file.
+            st.path = await self._require_input(chat_id, uid)
+            st = self.state(uid)
+            files = self._upload_files(st)
+        if not files:
+            if not st.queue.failed():
+                await self.render_ui(chat_id, uid, "No current file(s) to upload.", buttons=main_menu())
             return
         self.begin_job(uid, "GoFile upload")
         total_bytes = sum(self._safe_size(p) for p in files)
+        # ``uid`` must be a keyword here: passing it positionally landed it in
+        # ``text`` and pushed the message body into ``buttons``, which raised
+        # "got multiple values for argument 'buttons'" and killed every GoFile
+        # upload the moment the destination was chosen.
         status = await self.new_status_message(
-            chat_id, uid,
+            chat_id,
             f"{esc(label)}\n<b>Files:</b> {len(files)}\n<b>Total:</b> {format_bytes(total_bytes)}",
-            buttons=cancel_menu(), parse_mode="html",
+            buttons=cancel_menu(), parse_mode="html", uid=uid,
         )
         reporter = await self.progress_message(status, uid=uid)
         try:
@@ -3273,7 +3453,12 @@ class MediaToolsBot:
             return
         files = self._upload_files(st)
         if not files:
-            await self.render_ui(chat_id, uid, "No current file.", buttons=main_menu())
+            st.path = await self._require_input(chat_id, uid)
+            st = self.state(uid)
+            files = self._upload_files(st)
+        if not files:
+            if not st.queue.failed():
+                await self.render_ui(chat_id, uid, "No current file.", buttons=main_menu())
             return
         self.begin_job(uid, "Telegram upload")
         status = await self.new_status_message(chat_id, "Uploading to Telegram using MTProto\u2026", uid=uid, buttons=cancel_menu())
@@ -3792,26 +3977,14 @@ class MediaToolsBot:
             log.exception("orphan sweep failed")
 
     async def _sweep_orphans(self) -> None:
-        """Run the start-up orphan sweep off the event loop."""
+        """Run the start-up orphan sweep off the event loop.
+
+        This used to call the threaded helper and then repeat the whole sweep
+        inline, so the directories were walked twice and the second pass ran
+        ``shutil.rmtree`` directly on the event loop - blocking every other
+        user's message handling on start-up.
+        """
         await asyncio.to_thread(self._sweep_orphans_sync)
-        try:
-            if not self.cfg.download_dir.exists():
-                return
-            known_users = set(self.db.all_users())
-            removed = 0
-            for entry in self.cfg.download_dir.iterdir():
-                if not entry.is_dir():
-                    continue
-                if not entry.name.isdigit():
-                    continue
-                if int(entry.name) in known_users and self.state(int(entry.name)).queue.has_work():
-                    continue
-                shutil.rmtree(entry, ignore_errors=True)
-                removed += 1
-            if removed:
-                log.info("removed %d orphaned download director%s", removed, "y" if removed == 1 else "ies")
-        except Exception:
-            log.exception("orphan sweep failed")
 
     async def run(self):
         await self.start_web_server()

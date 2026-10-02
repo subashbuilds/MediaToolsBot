@@ -15,13 +15,17 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 - Telegram documents, videos, audio, photos and other media
 - HTTP/HTTPS direct file URLs
 - A link pasted inside a longer message is detected too
+- A link hidden behind anchor text ("Click Here") is detected as well
+- A text message with a link is read as a link, never as a media file — Telegram's invisible webpage preview used to make the bot queue a phantom file and then reject every action
 - URL input uses the same processing workflow as Telegram input
 - URL/file uploader can upload the current file to Telegram or GoFile
 - The action menu appears immediately; the transfer starts only when you pick an action
+- Choosing Upload or a Direct/Stream Link fetches a not-yet-transferred input instead of claiming there is no file
 - Media Information and the track lists are built from the file header, so they work without downloading the media
 - Several files can be queued and downloaded in parallel (see Bulk mode)
 - Telegram files are fetched in several byte ranges at once, not one request at a time
 - Download progress with speed, size/total and an ETA in minutes
+- A link that returns a web page rather than a file is rejected with a clear message
 - Private/loopback addresses are refused so the bot cannot be used to reach internal services
 
 ### 🎥 Video
@@ -32,6 +36,7 @@ The bot is designed for VPS/Docker deployment and treats Telegram media and HTTP
 - Individual stream selection
 - All audio / all subtitle selection
 - Custom stream selection: a full screen where every track is listed and taps are marked, and nothing is downloaded until **Apply**
+- Stream Extractor and Stream Remover share that screen and both honour it: in *remove* mode the marked tracks are dropped, in *extract* mode each marked track is pulled out into its own file and the whole set is offered for upload
 - Video trimmer
 - Remove audio
 - Lossless optimize/remux
@@ -203,6 +208,11 @@ https://your-domain.example/f/<token>/<filename>
 
 Set `PUBLIC_BASE_URL` when the platform does not expose a detectable public domain.
 
+The bot checks this **before** fetching anything: without a public origin there
+is no link to hand back, so there is no reason to spend a multi-gigabyte
+transfer first. A genuine download failure is reported as the failure it is,
+rather than as "send a media file first".
+
 ### 📋 Media Information
 
 The Telegram response is intentionally compact:
@@ -300,7 +310,34 @@ Please select your preferred action below 👇
 ⬇️ 1080p.mkv [1v+5a]
     ███████░░░░░░░  19.8% · 598 MiB / 2.95 GiB
     ⚡ 4.1 MiB/s · ⏳ 11m left
+    ⏱ 2m elapsed
+
+Cancel Process
 ```
+
+While bytes are moving the card shows **only** Cancel. The action menu used to
+stay on screen underneath the progress bar, which read as though the tap had
+been ignored — and none of those actions were usable until the transfer
+finished anyway. The full menu returns as soon as the file is on disk.
+
+**The card never freezes.** Pressing Apply (or any other action that needs the
+media) replaces the submenu with the download screen immediately, and the
+running item always carries an **elapsed** counter. That counter is what keeps
+the screen moving when a transfer is not producing bytes: a slow start, a
+throttled datacenter, or a genuinely stalled request used to leave the card
+painted on its very first frame for the whole wait, with a `0 B downloaded`
+line and nothing else — indistinguishable from a dead bot, for as long as the
+wait lasted. After 45 seconds without a byte the panel says so outright:
+
+```text
+⬇️ movie.mkv
+    ░░░░░░░░░░░░░░   0.0% · 0 B / 2.53 GiB
+    ⏱ 12m elapsed · ⚠️ no data for 8m
+```
+
+The known size is shown from the first frame — the queue already knows how big
+a queued file is, so there is no reason to wait for the first chunk to print a
+total.
 
 The ETA is printed in minutes rather than raw seconds, the speed is measured
 over the last interval and smoothed, and the card is repainted at most once per
@@ -368,6 +405,11 @@ A user's Cancel action:
 9. Returns the user to the dashboard.
 
 A cancelled job does not leave a stale `Cancel Process` message behind.
+
+Cancelling stops the running work and drops the pending workflow, but it never
+poisons the rest of the session: sending a new file afterwards starts a clean
+workflow, and a partial file from an aborted ranged download is deleted rather
+than left behind to eat the disk.
 
 ---
 

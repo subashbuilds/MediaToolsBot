@@ -29,11 +29,19 @@ def test_merge_menu_has_only_finish_and_cancel():
 
 
 def test_merge_dispatch_routes_captioned_media_before_pending_text():
+    """A captioned file sent during a merge must reach the merge collector.
+
+    The branch is keyed on ``is_media_message`` rather than
+    ``event.message.media``: Telegram sets ``.media`` for the invisible
+    webpage preview on a link-only text message, so the old test locked in the
+    very routing bug that broke every URL action.
+    """
     source = Path("app/main.py").read_text()
-    media_branch = 'elif self.state(uid).pending == "merge_collect" and event.message.media:'
+    media_branch = 'elif pending == "merge_collect" and has_media:'
     assert media_branch in source
-    assert source.index(media_branch) < source.index('elif self.state(uid).pending:\n            # Pending workflows')
-    assert "await self.receive_media(event)" in source[source.index(media_branch):source.index('elif self.state(uid).pending:\n            # Pending workflows')]
+    tail = source.index("elif pending:")
+    assert source.index(media_branch) < tail
+    assert "await self.receive_media(event)" in source[source.index(media_branch):tail]
 
 
 def test_merge_engine_video_audio_video(tmp_path):
