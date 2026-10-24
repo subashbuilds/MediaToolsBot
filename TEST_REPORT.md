@@ -8,7 +8,7 @@ This directory is the exact source tree packaged into the release ZIP.
 
 ```text
 pytest -q
-216 passed, 3 skipped
+233 passed, 4 skipped (live suite: 3 passed)
 
 MEDIABOT_LIVE=1 pytest -q tests/test_live_integrations.py
 3 passed
@@ -458,3 +458,59 @@ later Cancel cannot repaint the card that holds the link.
 All three bugs were reproduced against the unfixed source before the change, and
 reverting each fix makes exactly its matching test(s) fail — 3 of 6 fail when all
 three fixes are reverted, 1 when only the `cancel` guard is reverted.
+
+## Menu expansion pass — missing tools and the direct-link fix
+
+**Result: 233 passed, 4 skipped** (one of the skips is the local non-test guard in
+`tests/test_new_features.py`); `MEDIABOT_LIVE=1` live suite: **3 passed**;
+pyflakes on `app` clean apart from the intentional `cryptg` probe; `compileall`
+clean; `python -m app` starts and binds 0.0.0.0:8080 as `@MediaTooolsBot`.
+
+### What was delivered
+
+- **Direct/Stream Link auto-detection** (`app/services/public_url.py`): the
+  origin is resolved as `PUBLIC_BASE_URL` → managed-host env vars (Render,
+  Railway, Fly.io, Koyeb, Heroku, Replit) → the server's public egress IP
+  (ipify/ifconfig.me, response validated as an IP, cached 10 min). Detection
+  failures are reported *before* any download, with concrete instructions
+  instead of a bare refusal.
+- **New tools wired into `app/main.py`** (service-layer half landed earlier):
+  Create Archive (`app/services/packer.py`), standalone Rename File,
+  Caption & Buttons Editor (saves per-user caption/link button, applied to
+  Telegram uploads via `DB.upload_caption` / `button_label` / `button_url`,
+  all with upsert writes), Stream Mapper (`ffmpeg.map_streams`), Metadata
+  Editor (`ffmpeg.set_metadata`), Subtitle Merger (`ffmpeg.merge_subtitle`,
+  routes the sent `.srt/.ass/.vtt/...` through `receive_merge_subtitle`).
+  Every one of them stream-copies; validation errors (unknown/repeated stream
+  indices, unreadable tag lines, non-http button URLs, non-subtitle files)
+  are caught before anything runs, and the screen re-prompts.
+- **Main menu reorganised** (`app/ui/keyboards.py`): process/ship/personalise
+  grouping, two buttons per row, new entries for the tools above.
+
+### Bugs found on the way and covered by tests
+
+- `DB.set_upload_caption` / `set_upload_button` ran a plain `UPDATE` that
+  matched no row for a user without a `users` entry — the save **silently
+  vanished**. Fixed with `ensure(user_id)` upserts.
+- `public_url.origin_from_ip` assumed `cfg.web_port` existed; deployment
+  fixtures/test configs without it raised `AttributeError`. Now defaults to
+  8080.
+- The rename-continuation flow lost its final `choose_upload` call during
+  feature insertion — caught by pyflakes (`dest` unused) and restored.
+
+### Regression tests — `tests/test_new_features.py` (16 tests)
+
+| Scope | Tests |
+|---|---|
+| Create Archive | `test_pack_zips_the_current_file_and_offers_upload`, `test_pack_says_so_when_nothing_is_loaded` |
+| Rename File | `test_standalone_rename_renames_the_file_in_place`, `test_standalone_rename_keeps_the_session_pointing_at_the_new_file` |
+| Caption & Buttons | `test_caption_editor_saves_a_custom_caption`, `test_caption_editor_rejects_an_empty_caption`, `test_link_button_is_a_two_step_flow`, `test_a_caption_button_rejects_non_http_text`, `test_saved_caption_and_button_shape_uploads`, `test_clearing_the_editor_entries` |
+| Stream Mapper | `test_stream_mapper_orders_the_requested_streams`, `test_stream_mapper_rejects_unknown_and_repeated_streams` (real FFmpeg, real ffprobe verification of the output order) |
+| Metadata Editor | `test_metadata_editor_writes_and_removes_tags`, `test_metadata_editor_rejects_unreadable_lines` |
+| Subtitle Merger | `test_subtitle_merger_muxes_a_sent_srt` (verifies a real `subrip` track in the output), `test_subtitle_merger_ignores_non_subtitle_files` |
+
+Direct-link detection is covered in `tests/test_user_reported_bugs.py`:
+`test_direct_link_reports_a_missing_public_url_before_downloading` (refusal
+without a download when detection finds nothing, IP lookup mocked, no network)
+and `test_direct_link_auto_detects_origin_from_host_env` (managed-host env var,
+then egress-IP fallback including the `web_port` suffix).

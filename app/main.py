@@ -23,10 +23,13 @@ from .config import Config
 from .storage.db import DB
 from .ui.keyboards import (
     admin_menu, archive_collect_menu, archive_mode_menu, archive_password_menu,
-    audio_menu, bulk_menu, bulk_upload_menu, cancel_menu, main_menu, merge_menu,
-    merge_order_menu, merge_pick_menu, rename_menu, settings_menu, upload_menu, video_menu,
+    audio_menu, bulk_menu, bulk_upload_menu, cancel_menu, caption_menu, main_menu,
+    merge_menu, merge_order_menu, merge_pick_menu, rename_menu, settings_menu,
+    upload_menu, video_menu,
 )
 from .services import ffmpeg, ffprobe
+from .services.public_url import detect_public_origin
+from .services.packer import make_archive
 from .services.archive import extract_archive, is_archive, archive_requires_password, multipart_info
 from .services.bulk import DownloadQueue, QueueItem, render_bulk_prompt, render_queue
 from .services.downloader import download_url
@@ -230,6 +233,9 @@ class UserState:
     # been handed to the user. Nothing is running any more and the files/links
     # that are left are the deliverable, so Cancel must not throw them away.
     delivered: bool = False
+    # Label collected in the first step of the two-step "Set Link Button" flow,
+    # before the user sends the URL in the next step.
+    caption_button_label: str | None = None
 
     @property
     def busy(self) -> bool:
@@ -935,6 +941,11 @@ class MediaToolsBot:
         elif pending == "merge_collect" and links:
             # Merge collection accepts both Telegram files and HTTP(S) URLs.
             await self.process_merge_url(event.chat_id, uid, links[0])
+        elif pending == "merge_sub" and has_media:
+            # The subtitle file sent for Subtitle Merger is media, but it is
+            # not a merge track: without this branch it goes to the generic
+            # pending handler and the user is told to send text.
+            await self.receive_merge_subtitle(event)
         elif pending:
             # Pending workflows (trim, URL uploader, archive, upload, etc.)
             # must receive the text before the generic URL handler.
@@ -1890,6 +1901,18 @@ class MediaToolsBot:
         if st.pending == "archive_password":
             await self._begin_archive_extract(event.chat_id, uid, text)
             return
+        if st.pending == "rename_file":
+            await self._apply_standalone_rename(event.chat_id, uid, text); return
+        if st.pending == "caption_edit":
+            await self._apply_caption_text(event.chat_id, uid, text); return
+        if st.pending == "button_label":
+            await self._apply_button_label(event.chat_id, uid, text); return
+        if st.pending == "button_url":
+            await self._apply_button_url(event.chat_id, uid, text); return
+        if st.pending == "mapper_order":
+            await self._run_stream_mapper(event.chat_id, uid, text); return
+        if st.pending == "metadata_edit":
+            await self._run_metadata_editor(event.chat_id, uid, text); return
         if st.pending == "rename_input":
             await self.apply_rename_and_continue(event.chat_id, uid, text)
             return
@@ -1994,6 +2017,7 @@ class MediaToolsBot:
         return data.startswith((
             "menu:", "video:", "audio:", "stream:", "streamtoggle:",
             "aconv:", "archive", "merge", "upload:", "bulkupload:",
+            "caption:",
         ))
 
     async def callback_router(self, event, uid: int, data: str):
@@ -2074,6 +2098,44 @@ class MediaToolsBot:
             await self.run_thumbnail(event.chat_id, uid); return
         if data == "menu:direct":
             await self.run_direct(event.chat_id, uid, source=event); return
+        if data == "menu:pack":
+            await self.run_pack(event.chat_id, uid, source=event); return
+        if data == "menu:renamefile":
+            # Standalone rename of the current file - it is the same dialog the
+            # upload flow shows, but it ends here: the file keeps its new name
+            # and the user is taken back to the file menu.
+            st.pending = "rename_file"
+            await self.safe_edit(event, "\u270f\ufe0f <b>Rename file</b>\n\nSend the new filename, including extension if you want to change it.", buttons=cancel_menu(), parse_mode="html"); return
+        if data == "menu:caption":
+            await self._open_caption_editor(event.chat_id, uid, source=event); return
+        if data == "caption:edit":
+            st.pending = "caption_edit"
+            current = self.db.get_upload_caption(uid)
+            shown = esc(current) if current else "<i>(none - new uploads get their filename as caption)</i>"
+            await self.safe_edit(
+                event,
+                "\u270f\ufe0f <b>Edit Caption</b>\n\n"
+                f"Current caption for your uploads:\n{shown}\n\n"
+                "Send the text every upload should carry. <code>{name}</code> "
+                "in the text is replaced with the file's name.",
+                buttons=cancel_menu(), parse_mode="html",
+            ); return
+        if data == "caption:button":
+            st.pending = "button_label"
+            await self.safe_edit(
+                event,
+                "\U0001f517 <b>Set Link Button</b>\n\nStep 1 of 2: send the <b>label</b> shown on the button under your uploads.\nExample: <code>Join Channel</code>",
+                buttons=cancel_menu(), parse_mode="html",
+            ); return
+        if data == "caption:clear":
+            self.db.set_upload_caption(uid, None)
+            await self.answer(event, "Caption cleared.")
+            await self._open_caption_editor(event.chat_id, uid); return
+        if data == "caption:clear_button":
+            self.db.set_upload_button(uid, None, None)
+            st.caption_button_label = None
+            await self.answer(event, "Link button cleared.")
+            await self._open_caption_editor(event.chat_id, uid); return
         if data == "menu:urlupload":
             # A queued-but-not-yet-transferred input still counts: asking for
             # another link while one was already sent is the "URL
@@ -2144,6 +2206,12 @@ class MediaToolsBot:
             await self.start_merge(event.chat_id, uid, source=event); return
         if data == "video:extract":
             await self.stream_menu(event.chat_id, uid, "extract", source=event); return
+        if data == "video:mapper":
+            await self._open_stream_mapper(event.chat_id, uid, source=event); return
+        if data == "video:merge_sub":
+            await self._open_merge_subtitles(event.chat_id, uid, source=event); return
+        if data == "video:metadata":
+            await self._open_metadata_editor(event.chat_id, uid, source=event); return
         if data == "video:trim":
             st.pending = "trim"; await self.safe_edit(event, "✂️ Send `start end` in seconds or HH:MM:SS values.\nExample: `00:05 00:30`", buttons=cancel_menu(), parse_mode="markdown"); return
         if data == "video:remove_audio":
@@ -3052,17 +3120,24 @@ class MediaToolsBot:
         # queued transfer actually starts. It used to be a bare await_input()
         # followed by "send a media file first", which reported a perfectly
         # good input as missing whenever the transfer had not landed yet.
-        if not self.cfg.public_base_url:
-            # Checked before spending a multi-gigabyte download on a link the
-            # server cannot serve.
-            await self.render_card(
+        # The public origin is resolved right before the link is made, so a VPS
+        # or Docker deployment without PUBLIC_BASE_URL still produces a working
+        # address (the managed-host env vars and then the server's public egress
+        # IP are tried automatically).
+        origin = self.cfg.public_base_url or await detect_public_origin(self.cfg)
+        if not origin:
+            await self.render_ui(
                 chat_id, uid,
-                "🔗 <b>Direct/Stream Link is not configured on this server.</b>\n\n"
-                "Set <code>PUBLIC_BASE_URL</code> to your public HTTPS origin. "
-                "Railway/Render domains are detected automatically when their "
-                "standard environment variable is available.\n\n"
-                "The service must expose <code>WEB_PORT</code> (default 8080) publicly.",
-                buttons=main_menu(), parse_mode="html",
+                "🔗 <b>Direct/Stream Link is not available on this server.</b>\n\n"
+                "The bot could not work out a public address for itself.\n\n"
+                "<b>How to fix it (server owner):</b> set <code>PUBLIC_BASE_URL</code> "
+                "to the public HTTPS origin that reaches this server, and make sure "
+                "the web server (port <code>8080</code> by default) is reachable from "
+                "the internet (port-forward, tunnel or reverse proxy).\n\n"
+                "<b>Ideas that work without HTTPS:</b> expose the web port directly "
+                "with a public IP, or use any tunnel (cloudflared, ngrok) and set "
+                "<code>PUBLIC_BASE_URL</code> to the URL the tunnel gives you.",
+                buttons=[[Button.inline("\u2B05\uFE0F Back", b"menu:back")]], parse_mode="html", source=source,
             )
             return
         path = await self._require_input(chat_id, uid)
@@ -3072,7 +3147,7 @@ class MediaToolsBot:
         token = secrets.token_urlsafe(18)
         expires = int(time.time()) + self.cfg.direct_link_ttl
         self.db.add_direct_link(token, uid, str(path.resolve()), expires)
-        link = f"{self.cfg.public_base_url}/f/{token}/{quote(path.name)}"
+        link = f"{origin}/f/{token}/{quote(path.name)}"
         hours = max(1, self.cfg.direct_link_ttl // 3600)
         await self.render_ui(
             chat_id, uid,
@@ -3283,6 +3358,352 @@ class MediaToolsBot:
         if st.source_path == old: st.source_path = target
         if st.root_path == old: st.root_path = target
         await self.choose_upload(chat_id, uid, dest, skip_rename=True)
+
+    def _stream_lines(self, streams) -> str:
+        """One human-readable line per stream, numbered by container index."""
+        lines = []
+        for s in streams:
+            tags = s.get("tags") or {}
+            lang = tags.get("language") or tags.get("LANGUAGE") or ""
+            dims = f", {s.get('width')}x{s.get('height')}" if s.get("width") else ""
+            extra = f" [{lang}]" if lang else ""
+            codec = s.get("codec_name") or "?"
+            lines.append(f"  <code>{s.get('index')}</code> - {s.get('codec_type')} {codec}{dims}{extra}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # Stream Mapper
+    # ------------------------------------------------------------------
+    _MAPPER_PROMPT = (
+        "Send the stream <b>numbers</b> to keep, in the order you want them, "
+        "separated by commas or spaces. Example: <code>0,2,1</code> "
+        "(first video, then the second audio, then the first audio)."
+    )
+
+    async def _open_stream_mapper(self, chat_id: int, uid: int, source=None):
+        st = self.state(uid)
+        if not st.streams and not (st.probe_data or {}).get("streams"):
+            # Same as the track menus: give the header probe a moment before
+            # falling back to "you can still send the order now".
+            await self._wait_for_metadata(uid, timeout=15.0)
+        st = self.state(uid)
+        streams = (
+            st.streams
+            or (st.probe_data or {}).get("streams")
+            or (getattr(st.current_item, "streams", None) or [])
+        )
+        listing = self._stream_lines(streams)
+        st.pending = "mapper_order"
+        if listing:
+            text = (
+                "\U0001f3a7 <b>Stream Mapper</b>\n\n" + listing + "\n\n" + self._MAPPER_PROMPT
+            )
+        else:
+            text = (
+                "\U0001f3a7 <b>Stream Mapper</b>\n\n"
+                "<i>The track list has not been read yet.</i>\n\n" + self._MAPPER_PROMPT
+            )
+        await self.render_ui(chat_id, uid, text, buttons=cancel_menu(), parse_mode="html", source=source)
+
+    async def _run_stream_mapper(self, chat_id: int, uid: int, text: str):
+        st = self.state(uid)
+        st.pending = None
+        tokens = [t for t in re.split(r"[,\s]+", (text or "").strip()) if t]
+        try:
+            indices = [int(t) for t in tokens]
+        except ValueError:
+            st.pending = "mapper_order"
+            await self.render_ui(
+                chat_id, uid,
+                "\u274c Send stream numbers only, separated by commas or spaces. Example: <code>0,2,1</code>",
+                buttons=cancel_menu(), parse_mode="html",
+            )
+            return
+        if not indices:
+            st.pending = "mapper_order"
+            await self.render_ui(chat_id, uid, "Send at least one stream number. Example: <code>0,2,1</code>", buttons=cancel_menu(), parse_mode="html")
+            return
+        await self.await_input(chat_id, uid)
+        path = self.source_media(st)
+        if not path:
+            await self.render_ui(chat_id, uid, "This file is not available any more.", buttons=main_menu())
+            return
+        data = await asyncio.to_thread(ffprobe.safe_probe, path)
+        known = {s.get("index") for s in data.get("streams", [])}
+        out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.mapped.mkv")
+        if len(set(indices)) != len(indices):
+            st.pending = "mapper_order"
+            await self.render_ui(chat_id, uid, "Each stream may be listed only once. " + self._MAPPER_PROMPT, buttons=cancel_menu(), parse_mode="html")
+            return
+        unknown = [i for i in indices if i not in known]
+        if unknown:
+            listing = self._stream_lines(data.get("streams", []))
+            st.pending = "mapper_order"
+            await self.render_ui(
+                chat_id, uid,
+                f"\u274c Stream {unknown[0]} is not in this file.\n\n{listing}\n\n" + self._MAPPER_PROMPT,
+                buttons=cancel_menu(), parse_mode="html",
+            )
+            return
+        await self.execute(
+            chat_id, uid, "\U0001f3a7 Mapping streams",
+            self.make_ffmpeg_job(uid, lambda cb: ffmpeg.map_streams(path, out, indices, on_progress=cb), path),
+            upload=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Metadata Editor
+    # ------------------------------------------------------------------
+    _METADATA_PROMPT = (
+        "Send the tags to set, one per line. Examples:\n"
+        "<code>title=My Movie</code>\n<code>artist=Cool Band</code>\n\n"
+        "Use a leading dash to remove a tag: <code>-comment=</code>"
+    )
+    _METADATA_KEYS = re.compile(r"^-?([A-Za-z0-9_]+)=(.*)$", re.S)
+
+    async def _open_metadata_editor(self, chat_id: int, uid: int, source=None):
+        st = self.state(uid)
+        if not (st.probe_data or {}).get("format"):
+            await self._wait_for_metadata(uid, timeout=15.0)
+        st = self.state(uid)
+        tags = ((st.probe_data or {}).get("format") or {}).get("tags") or {}
+        known = ""
+        for key in ("title", "artist", "album", "comment", "description", "genre", "date"):
+            value = tags.get(key) or tags.get(key.upper())
+            if value:
+                known += f"  {key}: {esc(str(value)[:60])}\n"
+        if known:
+            known = "<b>Existing tags:</b>\n" + known + "\n"
+        st.pending = "metadata_edit"
+        await self.render_ui(
+            chat_id, uid,
+            "\U0001f3ac <b>Metadata Editor</b>\n\n" + known + self._METADATA_PROMPT,
+            buttons=cancel_menu(), parse_mode="html", source=source,
+        )
+
+    async def _run_metadata_editor(self, chat_id: int, uid: int, text: str):
+        st = self.state(uid)
+        st.pending = None
+        tags: dict[str, str] = {}
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            match = self._METADATA_KEYS.match(line)
+            if not match or not match.group(1):
+                st.pending = "metadata_edit"
+                await self.render_ui(
+                    chat_id, uid,
+                    f"\u274c I could not read this line: <code>{esc(line[:60])}</code>\n\n" + self._METADATA_PROMPT,
+                    buttons=cancel_menu(), parse_mode="html",
+                )
+                return
+            remove = line.lstrip().startswith("-")
+            key, value = match.group(1), match.group(2).strip()
+            tags[key] = "" if remove else value
+        if not tags:
+            st.pending = "metadata_edit"
+            await self.render_ui(chat_id, uid, "Send at least one tag line, for example <code>title=My Movie</code>.", buttons=cancel_menu(), parse_mode="html")
+            return
+        await self.await_input(chat_id, uid)
+        path = self.source_media(st)
+        if not path:
+            await self.render_ui(chat_id, uid, "This file is not available any more.", buttons=main_menu())
+            return
+        out = unique_path(self.cfg.work_dir / str(uid), f"{path.stem}.tagged{path.suffix or '.mkv'}")
+        await self.execute(
+            chat_id, uid, "\U0001f3ac Writing metadata",
+            self.make_ffmpeg_job(uid, lambda cb: ffmpeg.set_metadata(path, out, tags, on_progress=cb), path),
+            upload=True,
+        )
+
+    # ------------------------------------------------------------------
+    # Subtitle Merger
+    # ------------------------------------------------------------------
+    async def _open_merge_subtitles(self, chat_id: int, uid: int, source=None):
+        st = self.state(uid)
+        st.pending = "merge_sub"
+        await self.render_ui(
+            chat_id, uid,
+            "\U0001F4DD <b>Merge Subtitles</b>\n\n"
+            "Send the subtitle file: <code>.srt</code>, <code>.ass</code>, <code>.ssa</code>, "
+            "<code>.sub</code> or <code>.vtt</code>. It is muxed into the current video "
+            "as a selectable track - the video is copied, never re-encoded.",
+            buttons=cancel_menu(), parse_mode="html", source=source,
+        )
+
+    _SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".sub", ".vtt"}
+
+    async def receive_merge_subtitle(self, event):
+        uid = event.sender_id
+        st = self.state(uid)
+        message = event.message
+        file = getattr(message, "file", None)
+        name = safe_filename(getattr(file, "name", None) or "")
+        suffix = Path(name).suffix.lower() if name else ""
+        if suffix not in self._SUBTITLE_EXTS:
+            await event.reply("\u274c That is not a subtitle file. Send .srt, .ass, .ssa, .sub or .vtt - or press Cancel.")
+            return
+        status = await self.new_status_message(
+            event.chat_id, f"\U0001f4e5 Downloading subtitle\u2026\n{esc(name)}", uid=uid, buttons=cancel_menu(), parse_mode="html",
+        )
+        sub_dir = self.cfg.download_dir / str(uid) / "subtitles"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        out = unique_path(sub_dir, name)
+        try:
+            downloaded = await self.client.download_media(message, file=str(out))
+            if not downloaded:
+                raise RuntimeError("Telegram returned no subtitle file")
+            await self.safe_edit(status, "\U0001F4DD Merging subtitles\u2026", parse_mode="html")
+            video = await self.video_media(st)
+            if not video:
+                await self.await_input(event.chat_id, uid)
+                video = await self.video_media(st)
+            if not video:
+                st.pending = None
+                await self.safe_edit(status, "Send a video file first, then merge subtitles again.", buttons=None, parse_mode="html")
+                return
+            st.pending = None
+            out_path = unique_path(self.cfg.work_dir / str(uid), f"{video.stem}.subbed.mkv")
+            # execute() hands the result to the upload picker; afterwards the
+            # temporary subtitle file is no longer needed.
+            await self.execute(
+                event.chat_id, uid, "\U0001f4dd Merging subtitles",
+                self.make_ffmpeg_job(uid, lambda cb: ffmpeg.merge_subtitle(video, out, out_path, on_progress=cb), video),
+                upload=True,
+            )
+        except asyncio.CancelledError:
+            out.unlink(missing_ok=True)
+            await self.cancelled_status(uid, status)
+        except Exception as exc:
+            out.unlink(missing_ok=True)
+            await self.safe_edit(status, f"Subtitle merge failed:\n{esc(error_text(exc))}", buttons=None, parse_mode="html")
+        else:
+            out.unlink(missing_ok=True)
+
+
+    # ------------------------------------------------------------------
+    # Standalone Rename File
+    # ------------------------------------------------------------------
+    async def _apply_standalone_rename(self, chat_id: int, uid: int, text: str):
+        st = self.state(uid)
+        st.pending = None
+        if not st.path or not st.path.exists():
+            files = [p for p in st.outputs if p.exists()]
+            if not files:
+                await self.render_ui(chat_id, uid, "❌ No current file to rename. Send a media file first.", buttons=main_menu())
+                return
+            st.path = files[0]
+        old = st.path
+        new_name = safe_filename(text.strip(), old.name)
+        if not Path(new_name).suffix and old.suffix:
+            new_name += old.suffix
+        target = old.with_name(new_name)
+        if target != old and target.exists():
+            target = unique_path(old.parent, new_name)
+        try:
+            old.rename(target)
+        except OSError as exc:
+            await self.render_ui(chat_id, uid, f"Rename failed: {esc(error_text(exc))}", buttons=main_menu(), parse_mode="html")
+            return
+        st.path = target
+        st.original_name = target.name
+        st.outputs = [target if p == old else p for p in st.outputs]
+        if st.source_path == old: st.source_path = target
+        if st.root_path == old: st.root_path = target
+        # Renaming replaces the card (no new message lands in the chat).
+        await self.show_file_menu(chat_id, uid, target, fresh=False)
+
+    # ------------------------------------------------------------------
+    # Create Archive (zip)
+    # ------------------------------------------------------------------
+    async def run_pack(self, chat_id, uid, source=None):
+        # Packing needs the bytes, so - like every other action - the transfer
+        # starts here and not when the file was first sent.
+        path = await self._require_input(chat_id, uid)
+        if path is None:
+            return
+        out = unique_path(self.cfg.work_dir / str(uid), f"{Path(path).stem}.zip")
+        # ffmpeg=False: zipping has no FFmpeg progress to report and does not
+        # need the transcode semaphore - it is a plain threaded file copy.
+        await self.execute(
+            chat_id, uid, "\U0001f9ec Creating archive",
+            self.make_ffmpeg_job(uid, lambda: make_archive(Path(path), out)),
+            upload=True, set_source=True, ffmpeg=False,
+        )
+
+    # ------------------------------------------------------------------
+    # Caption & Buttons editor
+    # ------------------------------------------------------------------
+    async def _open_caption_editor(self, chat_id: int, uid: int, source=None):
+        caption = self.db.get_upload_caption(uid)
+        button = self.db.get_upload_button(uid)
+        cap_text = esc(caption) if caption else "<i>(none - uploads use the file name)</i>"
+        if button:
+            button_text = f"{esc(button[0])} \u2192 {esc(button[1])}"
+        else:
+            button_text = "<i>(none)</i>"
+        await self.render_ui(
+            chat_id, uid,
+            "\u270f\ufe0f <b>Caption & Buttons Editor</b>\n\n"
+            f"<b>Upload caption:</b> {cap_text}\n"
+            f"<b>Link button:</b> {button_text}\n\n"
+            "These are applied to every upload you send, on this account.",
+            buttons=caption_menu(), parse_mode="html", link_preview=False, source=source,
+        )
+
+    async def _apply_caption_text(self, chat_id: int, uid: int, text: str):
+        st = self.state(uid)
+        st.pending = None
+        value = text.strip()
+        if not value or len(value) > 1024:
+            await self.render_ui(chat_id, uid, "Please send a caption between 1 and 1024 characters.", buttons=caption_menu(), parse_mode="html")
+            st.pending = "caption_edit"
+            return
+        self.db.set_upload_caption(uid, value)
+        await self._open_caption_editor(chat_id, uid)
+
+    async def _apply_button_label(self, chat_id: int, uid: int, text: str):
+        st = self.state(uid)
+        st.pending = None
+        value = text.strip()
+        if not value or len(value) > 64:
+            await self.render_ui(chat_id, uid, "Send a button label of up to 64 characters.", buttons=cancel_menu(), parse_mode="html")
+            st.pending = "button_label"
+            return
+        st.caption_button_label = value
+        st.pending = "button_url"
+        await self.render_ui(
+            chat_id, uid,
+            f"\U0001f517 <b>Set Link Button</b>\n\n\u2705 Label: {esc(value)}\n\n"
+            "Step 2 of 2: send the <b>URL</b> the button opens.\nExample: <code>https://example.com</code>",
+            buttons=cancel_menu(), parse_mode="html",
+        )
+
+    async def _apply_button_url(self, chat_id: int, uid: int, text: str):
+        st = self.state(uid)
+        st.pending = None
+        value = text.strip()
+        if not re.match(r"^https?://", value, re.I) or len(value) > 256:
+            await self.render_ui(chat_id, uid, "That is not a valid http(s) URL. Send the URL the button should open.", buttons=cancel_menu(), parse_mode="html")
+            st.pending = "button_url"
+            return
+        self.db.set_upload_button(uid, st.caption_button_label, value)
+        st.caption_button_label = None
+        await self._open_caption_editor(chat_id, uid)
+
+    def _upload_caption_and_button(self, uid: int, path: Path, chunk: int, chunks: int):
+        """Caption text and inline button for one uploaded file."""
+        caption = self.db.get_upload_caption(uid)
+        if caption:
+            caption = caption.replace("{name}", path.name)
+            if chunks > 1:
+                caption = f"{caption} \u2014 part {chunk}/{chunks}"
+        else:
+            caption = path.name if chunks == 1 else f"{path.name} \u2014 part {chunk}/{chunks}"
+        button = self.db.get_upload_button(uid)
+        buttons = [Button.url(button[0], button[1])] if button and chunks == 1 else None
+        return caption, buttons
 
     async def choose_upload(self, chat_id, uid, destination: str | None = None, skip_rename: bool = False):
         st = self.state(uid)
@@ -3509,7 +3930,10 @@ class MediaToolsBot:
                             if st.cancel_event.is_set():
                                 raise asyncio.CancelledError
                             item_size = self._safe_size(item)
-                            caption = path.name if len(chunks) == 1 else f"{path.name} \u2014 part {idx}/{len(chunks)}"
+                            # A saved caption (with the file's name available
+                            # through {name}) replaces the filename caption; the
+                            # saved URL button is attached to single-part sends.
+                            caption, upload_buttons = self._upload_caption_and_button(uid, path, idx, len(chunks))
 
                             async def cb(cur, file_total, *, base=done, label=item.name):
                                 if st.cancel_event.is_set():
@@ -3519,6 +3943,7 @@ class MediaToolsBot:
                             await self.client.send_file(
                                 chat_id, str(item), caption=caption,
                                 force_document=(telegram_mode == "document" or len(chunks) > 1),
+                                buttons=upload_buttons,
                                 thumb=thumb if thumb and Path(thumb).exists() and len(chunks) == 1 else None,
                                 progress_callback=cb,
                             )

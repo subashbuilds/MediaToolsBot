@@ -204,6 +204,26 @@ The download link is in the message above. Temporary files were cleaned up.
 [🏠 Start]
 ```
 
+### 🧰 Other tools on the menu
+
+- **Rename File** — renames the *current* file outright (same dialog as the
+  pre-upload rename flow, but it ends at the file menu); the extension is
+  kept from the old name when the new name has none
+- **Create Archive** — packs the current file into a `.zip` (stored entries:
+  recompressing already-compressed media wastes minutes of CPU for nothing)
+  and offers the zip to the upload picker
+- **Stream Mapper** — rebuilds the container with the streams you list, in
+  the order you list them, stream-copied. Send the numbers from the listing,
+  e.g. `0,2,1`; foreign indices or repeats are caught before anything runs
+- **Metadata Editor** — sets/removes container tags with a stream copy. Send
+  `key=value` lines (`title=…`, `artist=…`); a leading dash (`-comment=`)
+  deletes the tag. Existing tags are shown on the screen first
+- **Merge Subtitles** — send an `.srt` / `.ass` / `.ssa` / `.sub` / `.vtt`
+  file and it is muxed into the current video as a selectable track; output
+  is MKV (MP4 would force mov_text and mangle ASS styling)
+
+Everything above stream-copies: none of these re-encodes the media.
+
 ### 🔗 Direct / Stream Link
 
 The bot includes a small HTTP server for locally stored files.
@@ -213,7 +233,9 @@ The bot includes a small HTTP server for locally stored files.
 - HTTP Range requests / seeking
 - Random signed tokens
 - Default lifetime: 24 hours
-- Public URL can be supplied explicitly or detected from common Railway/Render environment variables
+- Public origin resolved automatically, in order: `PUBLIC_BASE_URL`, then the
+  managed-host env vars (Render, Railway, Fly.io, Koyeb, Heroku, Replit),
+  then the server's public egress IP
 
 Example:
 
@@ -221,12 +243,24 @@ Example:
 https://your-domain.example/f/<token>/<filename>
 ```
 
-Set `PUBLIC_BASE_URL` when the platform does not expose a detectable public domain.
+The origin is still looked for **before** a byte is downloaded: without a
+usable public address there is no link to hand back, so a multi-gigabyte
+transfer would be wasted. When detection finds nothing the card explains
+to the server owner - in practical terms - exactly what to set and open
+(port-forward, tunnel or reverse proxy), instead of just refusing.
 
-The bot checks this **before** fetching anything: without a public origin there
-is no link to hand back, so there is no reason to spend a multi-gigabyte
-transfer first. A genuine download failure is reported as the failure it is,
-rather than as "send a media file first".
+### ✍️ Caption & Buttons Editor
+
+Under **Caption & Buttons** every user can set, per account:
+
+- **Upload caption** - replaces the filename caption; `{name}` in the text is
+  replaced with the file's name
+- **Link button** - a labelled URL button under every upload (set in two
+  steps: label, then URL; only http(s) accepted)
+
+Both can be cleared from the same screen. They are saved in the database and
+applied by the Telegram upload path; multi-part sends carry the part number
+after the caption and no button.
 
 ### 📋 Media Information
 

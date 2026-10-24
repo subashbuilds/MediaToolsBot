@@ -328,3 +328,75 @@ def extract_stream(path: Path, output: Path, stream_index: int, on_progress: Pro
     args += [str(output)]
     _run(args, on_progress=on_progress)
     return output
+
+
+def map_streams(path: Path, output: Path, stream_indices: list[int], on_progress: ProgressSink = None) -> Path:
+    """Stream Mapper: rebuild the container with the given streams, in order.
+
+    ``extract_stream`` pulls one track out into its own file; the mapper keeps
+    every track the user listed, drops none and reorders them, which is the
+    "put the audio I want in place, drop the second video angle" use case.
+    """
+    known = {s.get("index") for s in probe(path).get("streams", [])}
+    unknown = [i for i in stream_indices if i not in known]
+    if unknown:
+        raise ValueError(f"Stream {unknown[0]} does not exist in this file")
+    if len(set(stream_indices)) != len(stream_indices):
+        raise ValueError("Each stream may be listed only once")
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+        *_map_args(stream_indices), "-map_metadata", "0", "-c", "copy",
+    ]
+    args += _progress_args(on_progress)
+    args += [str(output)]
+    _run(args, on_progress=on_progress)
+    return output
+
+
+def set_metadata(path: Path, output: Path, tags: dict[str, str], on_progress: ProgressSink = None) -> Path:
+    """Apply container metadata with a stream copy, never a re-encode."""
+    if not tags:
+        raise ValueError("No metadata was supplied")
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+        "-map", "0", "-c", "copy",
+    ]
+    for key, value in tags.items():
+        args += ["-metadata", f"{key}={value}"]
+    args += _progress_args(on_progress)
+    args += [str(output)]
+    _run(args, on_progress=on_progress)
+    return output
+
+
+SUBTITLE_COPY_EXTS = {".srt", ".ass", ".ssa", ".sub"}
+
+
+def merge_subtitle(path: Path, sub: Path, output: Path, on_progress: ProgressSink = None) -> Path:
+    """Mux an external subtitle file into the media as an extra track.
+
+    The output container is always MKV: it accepts every text subtitle ffmpeg
+    supports (SRT, ASS/SSA, VTT) and keeps the rest of the file a bit-for-bit
+    copy, so a 2 GiB film costs no re-encode. MP4 would force every text track
+    through mov_text, which mangles ASS styling, so it is never chosen here.
+    """
+    if not sub.exists():
+        raise ValueError("The subtitle file is no longer available")
+    args = [
+        "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path),
+        "-i", str(sub),
+        "-map", "0", "-map", "1:0",
+        "-c", "copy",
+    ]
+    args += _progress_args(on_progress)
+    args += [str(output)]
+    try:
+        _run(args, on_progress=on_progress)
+    except Exception:
+        # A track the MKV muxer cannot copy (an odd VTT or a bitmap stream)
+        # must not sink the whole job: converting every text track to SRT is
+        # the next-best result, styling included is just plain text.
+        fallback = [a for a in args if a != str(output)]
+        fallback = fallback[: len(fallback) - len(_progress_args(on_progress))] if on_progress else fallback
+        _run(fallback + ["-c:s", "srt", *_progress_args(on_progress), str(output)], on_progress=on_progress)
+    return output

@@ -4,13 +4,15 @@ from telethon import Button
 
 
 def main_menu():
+    # Grouped so the flow reads top to bottom: process the file, then ship it,
+    # then personalise how it is delivered. Two buttons per row keep a clean
+    # grid on phones instead of one endless column.
     return [
-        [Button.inline("🖼️ Thumbnail Downloader", b"menu:thumb")],
-        [Button.inline("🔗 Make Direct/Stream Link", b"menu:direct")],
-        [Button.inline("📤 URL Uploader", b"menu:urlupload")],
-        [Button.inline("📦 Extract Archive", b"menu:archive")],
-        [Button.inline("🎵 Audio", b"menu:audio"), Button.inline("🎥 Video", b"menu:video")],
-        [Button.inline("📤 Upload", b"menu:upload")],
+        [Button.inline("🎥 Video", b"menu:video"), Button.inline("🎵 Audio", b"menu:audio")],
+        [Button.inline("📤 Upload", b"menu:upload"), Button.inline("🔗 Direct Link", b"menu:direct")],
+        [Button.inline("📤 URL Uploader", b"menu:urlupload"), Button.inline("🧬 Create Archive", b"menu:pack")],
+        [Button.inline("📦 Extract Archive", b"menu:archive"), Button.inline("🖼️ Thumbnail", b"menu:thumb")],
+        [Button.inline("✏️ Rename File", b"menu:renamefile"), Button.inline("✍️ Caption & Buttons", b"menu:caption")],
         [Button.inline("Cancel ❌", b"cancel")],
     ]
 
@@ -36,12 +38,14 @@ def video_menu():
     return [
         [Button.inline("📋 Media Information", b"video:info")],
         [Button.inline("🎵 Stream Remover", b"video:streams"), Button.inline("🎵 Stream Extractor", b"video:extract")],
+        [Button.inline("🎚 Stream Mapper", b"video:mapper")],
+        [Button.inline("📝 Merge Subtitles", b"video:merge_sub"), Button.inline("🎚 Metadata Editor", b"video:metadata")],
         [Button.inline("✂️ Video Trimmer", b"video:trim"), Button.inline("📕 Remove Audio", b"video:remove_audio")],
         [Button.inline("🎥 Video Optimize", b"video:optimize"), Button.inline("🎥 Videos Splitter", b"video:split")],
+        [Button.inline("🎬 Video To MP4", b"video:mp4"), Button.inline("🎞️ Video To MKV", b"video:mkv")],
         [Button.inline("🔀 Merge Tracks", b"video:merge")],
         [Button.inline("🖼️ Screenshots", b"video:shots"), Button.inline("🖼️ Manual Shots", b"video:manual")],
         [Button.inline("🎥 Generate Sample", b"video:sample"), Button.inline("🎵 Video To Audio", b"video:toaudio")],
-        [Button.inline("🎥 Video To MP4", b"video:mp4"), Button.inline("🎥 Video To MKV", b"video:mkv")],
         [Button.inline("⬅️ Back", b"video:back"), Button.inline("Cancel ❌", b"cancel")],
     ]
 
@@ -55,6 +59,15 @@ def audio_menu():
         [Button.inline("🎵 Speed Change", b"audio:speed"), Button.inline("🔊 Volume Change", b"audio:volume")],
         [Button.inline("📋 Media Information", b"audio:info"), Button.inline("🔊 Compress Audio", b"audio:compress")],
         [Button.inline("⬅️ Back", b"audio:back"), Button.inline("Cancel ❌", b"cancel")],
+    ]
+
+
+def caption_menu():
+    """The Caption & Buttons Editor screen."""
+    return [
+        [Button.inline("✍️ Edit Caption", b"caption:edit"), Button.inline("🔗 Set Link Button", b"caption:button")],
+        [Button.inline("🗑️ Clear Caption", b"caption:clear"), Button.inline("🗑️ Clear Button", b"caption:clear_button")],
+        [Button.inline("⬅️ Back", b"start:home"), Button.inline("Cancel ❌", b"cancel")],
     ]
 
 

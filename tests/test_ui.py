@@ -22,8 +22,9 @@ def flatten(rows):
 
 
 def test_ui_layout_counts():
-    assert [len(r) for r in main_menu()] == [1, 1, 1, 1, 2, 1, 1]
-    assert len(video_menu()) == 9
+    # The main menu is a 2-per-row grid plus one full-width Cancel row.
+    assert [len(r) for r in main_menu()] == [2, 2, 2, 2, 2, 1]
+    assert len(video_menu()) == 11
     assert len(audio_menu()) == 7
 
 

@@ -15,6 +15,7 @@ Each test drives the real code path with the real rendering and the real
 message router, so it fails the same way the deployment did.
 """
 import asyncio
+import os
 import sys
 import types
 from pathlib import Path
@@ -24,7 +25,10 @@ import pytest
 from tests.test_download_pipeline import make_bot
 from tests.test_ui_semantics import FaithfulClient
 
+from app.services import public_url
+
 main_mod = __import__("app.main", fromlist=["main"])
+original_public_ip = public_url.public_ip
 
 
 class Event:
@@ -314,11 +318,23 @@ def test_a_failed_download_is_not_reported_as_a_missing_file(tmp_path):
 
 
 def test_direct_link_reports_a_missing_public_url_before_downloading(tmp_path):
-    """No point spending a 3 GiB transfer on a link the server cannot serve."""
+    """No point spending a 3 GiB transfer on a link the server cannot serve.
+
+    With auto-detection the bot first tries PUBLIC_BASE_URL, then the managed
+    host's own env vars, then its public egress IP. Only when all of that
+    fails does it report the problem - before downloading anything.
+    """
     async def run():
         bot = make_bot(tmp_path, FaithfulClient())
         bot.cfg.public_base_url = None
         bot.cfg.reactions_enabled = False
+        public_url.clear_cache()
+
+        async def no_ip(timeout=8.0):
+            return None
+
+        # Detection is unavailable: the bot must refuse before downloading.
+        public_url.public_ip = no_ip
         uid = 1
         bot.db.register_user(uid, "u", "U", None)
         await bot.on_new_message(Event(bot, uid, message=link_post()))
@@ -329,12 +345,86 @@ def test_direct_link_reports_a_missing_public_url_before_downloading(tmp_path):
             return None
 
         bot._download_url_item = spy
-        await bot.callback_router(Event(bot, uid, "menu:direct"), uid, "menu:direct")
-        return bot.client.rendered, started
+        try:
+            await bot.callback_router(Event(bot, uid, "menu:direct"), uid, "menu:direct")
+            rendered = list(bot.client.rendered)
+            assert not started, "the file was downloaded even though no link can be made"
+            assert any("PUBLIC_BASE_URL" in t for t in rendered), rendered
+        finally:
+            public_url.public_ip = original_public_ip
 
-    rendered, started = asyncio.run(run())
-    assert not started, "the file was downloaded even though no link can be made"
-    assert any("PUBLIC_BASE_URL" in t for t in rendered), rendered
+    asyncio.run(run())
+
+
+def test_direct_link_auto_detects_origin_from_host_env(tmp_path):
+    """A plain VPS/Docker deployment works without PUBLIC_BASE_URL.
+
+    First from the platform env vars, then (in a second run) from the server's
+    public egress IP.
+    """
+    async def run_env():
+        bot = make_bot(tmp_path / "env", FaithfulClient())
+        bot.cfg.public_base_url = None
+        bot.cfg.reactions_enabled = False
+        uid = 1
+        bot.db.register_user(uid, "u", "U", None)
+        await bot.on_new_message(Event(bot, uid, message=link_post()))
+
+        async def fake_download(u, item):
+            target = tmp_path / "env" / "shown.mkv"
+            target.write_bytes(b"x" * 2048)
+            item.path = target
+            return target
+
+        bot._download_url_item = fake_download
+        (tmp_path / "env").mkdir(exist_ok=True)
+        os.environ["RENDER_EXTERNAL_URL"] = "https://demo.onrender.com"
+        public_url.clear_cache()
+        try:
+            await bot.callback_router(Event(bot, uid, "menu:direct"), uid, "menu:direct")
+            return list(bot.client.rendered)
+        finally:
+            os.environ.pop("RENDER_EXTERNAL_URL", None)
+            public_url.clear_cache()
+
+    rendered = asyncio.run(run_env())
+    assert any("demo.onrender.com" in t for t in rendered), rendered
+
+    async def run_ip():
+        bot = make_bot(tmp_path / "ip", FaithfulClient())
+        bot.cfg.public_base_url = None
+        bot.cfg.web_port = 8085
+        bot.cfg.reactions_enabled = False
+        uid = 2
+        bot.db.register_user(uid, "u", "U", None)
+        await bot.on_new_message(Event(bot, uid, message=link_post()))
+
+        async def fake_download(u, item):
+            target = tmp_path / "ip" / "shown.mkv"
+            target.write_bytes(b"x" * 2048)
+            item.path = target
+            return target
+
+        bot._download_url_item = fake_download
+        (tmp_path / "ip").mkdir(exist_ok=True)
+        os.environ.pop("PUBLIC_BASE_URL", None)
+        os.environ.pop("RENDER_EXTERNAL_URL", None)
+        os.environ.pop("APP_URL", None)
+        public_url.clear_cache()
+
+        async def fake_ip(timeout=8.0):
+            return "203.0.113.7"
+
+        public_url.public_ip = fake_ip
+        try:
+            await bot.callback_router(Event(bot, uid, "menu:direct"), uid, "menu:direct")
+            return list(bot.client.rendered)
+        finally:
+            public_url.public_ip = original_public_ip
+            public_url.clear_cache()
+
+    rendered = asyncio.run(run_ip())
+    assert any("http://203.0.113.7:8085" in t for t in rendered), rendered
 
 
 # ----------------------------------------------------------------------

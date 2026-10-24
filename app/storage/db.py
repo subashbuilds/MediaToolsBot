@@ -48,6 +48,9 @@ class DB:
             ("bulk_mode", "INTEGER NOT NULL DEFAULT 0"),
             ("auto_delete", "INTEGER NOT NULL DEFAULT 0"),
             ("keep_files", "INTEGER NOT NULL DEFAULT 0"),
+            ("upload_caption", "TEXT"),
+            ("button_label", "TEXT"),
+            ("button_url", "TEXT"),
         ):
             if column not in columns:
                 self.conn.execute(f"ALTER TABLE users ADD COLUMN {column} {definition}")
@@ -201,6 +204,31 @@ class DB:
 
     def set_keep_files(self, user_id: int, enabled: bool) -> None:
         self._set_flag(user_id, "keep_files", enabled)
+
+    # -- caption & button editor ---------------------------------------
+    def get_upload_caption(self, user_id: int) -> str | None:
+        with self._lock:
+            row = self.conn.execute("SELECT upload_caption FROM users WHERE user_id=?", (user_id,)).fetchone()
+        caption = (row or [None])[0] if row else None
+        return caption or None
+
+    def set_upload_caption(self, user_id: int, caption: str | None) -> None:
+        # Users CAN reach the caption editor before they have a users row, so
+        # the write must upsert - a plain UPDATE matched nothing and the save
+        # silently vanished.
+        self.ensure(user_id)
+        self._write("UPDATE users SET upload_caption=? WHERE user_id=?", (caption or None, user_id))
+
+    def get_upload_button(self, user_id: int) -> tuple[str, str] | None:
+        with self._lock:
+            row = self.conn.execute("SELECT button_label, button_url FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if not row or not row[0] or not row[1]:
+            return None
+        return str(row[0]), str(row[1])
+
+    def set_upload_button(self, user_id: int, label: str | None, url: str | None) -> None:
+        self.ensure(user_id)
+        self._write("UPDATE users SET button_label=?, button_url=? WHERE user_id=?", (label or None, url or None, user_id))
 
     def user_count(self) -> int:
         return int(self._query("SELECT COUNT(*) FROM users")[0][0])
